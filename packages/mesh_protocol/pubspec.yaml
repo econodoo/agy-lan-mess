@@ -1,0 +1,11 @@
+name: mesh_protocol
+description: Shared protocol models and WebSocket/MCP wire types for AGY LAN Mesh.
+version: 1.0.0
+publish_to: none
+resolution: workspace
+
+environment:
+  sdk: ^3.7.0
+
+dev_dependencies:
+  test: ^1.25.0

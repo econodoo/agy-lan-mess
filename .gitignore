@@ -1,0 +1,21 @@
+# Dart / Flutter build & tool caches
+.dart_tool/
+build/
+downloads/
+**/build/
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/pubspec.lock
+
+# Android / Gradle local artifacts
+apps/mesh_client/android/.gradle/
+apps/mesh_client/android/local.properties
+apps/mesh_client/android/**/GeneratedPluginRegistrant.java
+
+# Ephemeral / IDE files
+.idea/
+.vscode/
+*.iml
+*.log
+.DS_Store

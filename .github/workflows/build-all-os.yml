@@ -1,0 +1,195 @@
+name: Multi-OS Build & Release (Windows, Linux, macOS, Android, Web)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Analyze & Test (Protocol, Server, Client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Workspace Dependencies
+        run: flutter pub get
+      - name: Static Analysis
+        run: |
+          dart analyze packages/mesh_protocol packages/mesh_server
+          cd apps/mesh_client && flutter analyze
+      - name: Run Protocol, Hub/MCP Integration & Widget Tests
+        run: |
+          (cd packages/mesh_protocol && dart test)
+          (cd packages/mesh_server && dart test)
+          (cd apps/mesh_client && flutter test)
+
+  build-windows:
+    name: Build Windows x64 (Client App + Hub Server)
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Dependencies
+        run: flutter pub get
+      - name: Compile Native Hub Server (.exe)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/windows/server | Out-Null
+          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/windows/server/agy-mesh-server.exe
+          Copy-Item -Recurse scripts dist/windows/server/scripts
+      - name: Build Flutter Windows Desktop Client
+        working-directory: apps/mesh_client
+        run: flutter build windows --release
+      - name: Package Windows Zip Archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/windows/client | Out-Null
+          Copy-Item -Recurse apps/mesh_client/build/windows/x64/runner/Release/* dist/windows/client/
+          Copy-Item README.md dist/windows/
+          Compress-Archive -Path dist/windows/* -DestinationPath agy-lan-mesh-windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agy-lan-mesh-windows-x64
+          path: agy-lan-mesh-windows-x64.zip
+
+  build-linux:
+    name: Build Linux x64 & Web (Client App + Hub Server + Web Console)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux Desktop Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Dependencies
+        run: flutter pub get
+      - name: Build Flutter Web Console
+        working-directory: apps/mesh_client
+        run: flutter build web --release
+      - name: Build Flutter Linux Desktop Client
+        working-directory: apps/mesh_client
+        run: flutter build linux --release
+      - name: Compile Native Hub Server & Package Tarball
+        run: |
+          mkdir -p dist/linux/server dist/linux/client dist/linux/apps/mesh_client/build
+          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/linux/server/agy-mesh-server
+          cp -r scripts dist/linux/
+          cp -r apps/mesh_client/build/web dist/linux/apps/mesh_client/build/web
+          cp -r apps/mesh_client/build/linux/x64/release/bundle/* dist/linux/client/
+          cp README.md dist/linux/
+          tar -czf agy-lan-mesh-linux-x64.tar.gz -C dist/linux .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agy-lan-mesh-linux-x64
+          path: agy-lan-mesh-linux-x64.tar.gz
+
+  build-macos:
+    name: Build macOS (Client App + Hub Server)
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Enable macOS Desktop Platform & LAN Entitlements
+        run: |
+          cd apps/mesh_client
+          if [ ! -d macos ]; then
+            flutter create --platforms=macos .
+          fi
+          cat > macos/Runner/Release.entitlements << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.app-sandbox</key>
+            <false/>
+            <key>com.apple.security.network.client</key>
+            <true/>
+            <key>com.apple.security.network.server</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          cp macos/Runner/Release.entitlements macos/Runner/DebugProfile.entitlements
+      - name: Resolve Dependencies
+        run: flutter pub get
+      - name: Build Flutter macOS Client & Native Hub Server
+        run: |
+          mkdir -p dist/macos/server
+          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/macos/server/agy-mesh-server
+          cp -r scripts dist/macos/
+          (cd apps/mesh_client && flutter build macos --release)
+          cp -R apps/mesh_client/build/macos/Build/Products/Release/*.app dist/macos/
+          cp README.md dist/macos/
+          cd dist/macos && zip -r ../../agy-lan-mesh-macos.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agy-lan-mesh-macos
+          path: agy-lan-mesh-macos.zip
+
+  build-android:
+    name: Build Android APK
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Dependencies & Build Release APK
+        run: |
+          flutter pub get
+          cd apps/mesh_client && flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk ../../agy-lan-mesh-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agy-lan-mesh-android-apk
+          path: agy-lan-mesh-android.apk
+
+  release:
+    name: Publish Multi-OS Release Assets
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [build-windows, build-linux, build-macos, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create/Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: AGY LAN Mesh Build #${{ github.run_number }} (Windows, Linux, macOS, Android)
+          generate_release_notes: true
+          files: |
+            release-assets/agy-lan-mesh-windows-x64.zip
+            release-assets/agy-lan-mesh-linux-x64.tar.gz
+            release-assets/agy-lan-mesh-macos.zip
+            release-assets/agy-lan-mesh-android.apk

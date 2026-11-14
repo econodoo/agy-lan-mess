@@ -1,0 +1,27 @@
+name: mesh_client
+description: AGY LAN Mesh Cross-Platform Client Agent & Multi-Session Brain Console.
+publish_to: 'none'
+version: 1.0.0+1
+resolution: workspace
+
+environment:
+  sdk: ^3.7.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  mesh_protocol:
+    path: ../../packages/mesh_protocol
+  path: ^1.9.1
+  shared_preferences: ^2.3.3
+  uuid: ^4.5.1
+  web_socket_channel: ^3.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

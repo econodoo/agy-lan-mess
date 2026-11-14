@@ -1,0 +1,9 @@
+name: agy_lan_mesh_workspace
+publish_to: none
+environment:
+  sdk: ^3.7.0
+
+workspace:
+  - packages/mesh_protocol
+  - packages/mesh_server
+  - apps/mesh_client
