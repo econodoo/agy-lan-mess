@@ -25,6 +25,12 @@ class WsTypes {
   static const String chatCancel = 'chat.cancel';
   static const String chatEvent = 'chat.event';
 
+  // Server Brain Health, Auth, Quota & Model Control
+  static const String brainStatusGet = 'brain.status_get';
+  static const String brainPingTest = 'brain.ping_test';
+  static const String brainSetModel = 'brain.set_model';
+  static const String brainStatus = 'brain.status';
+
   // Server -> Target Node RPC
   static const String rpcExec = 'rpc.exec';
   static const String rpcExecResult = 'rpc.exec_result';

@@ -49,10 +49,19 @@ Future<void> main(List<String> arguments) async {
   final nodesParser = ArgParser()
     ..addOption('url', defaultsTo: 'http://127.0.0.1:8765');
 
+  final doctorParser = ArgParser()
+    ..addOption('url', defaultsTo: 'http://127.0.0.1:8765')
+    ..addFlag(
+      'ping',
+      defaultsTo: true,
+      help: 'Run a live 1-turn Antigravity quota & connectivity ping',
+    );
+
   parser
     ..addCommand('start', startParser)
     ..addCommand('sessions', sessionsParser)
-    ..addCommand('nodes', nodesParser);
+    ..addCommand('nodes', nodesParser)
+    ..addCommand('doctor', doctorParser);
 
   ArgResults results;
   try {
@@ -76,6 +85,8 @@ Future<void> main(List<String> arguments) async {
     await _runSessionsCli(cmd);
   } else if (cmd.name == 'nodes') {
     await _runNodesCli(cmd);
+  } else if (cmd.name == 'doctor') {
+    await _runDoctorCli(cmd);
   }
 }
 
@@ -270,6 +281,45 @@ Future<void> _runNodesCli(ArgResults cmd) async {
         '${n["ipAddress"]} (${n["nodeId"]})',
       );
     }
+  } finally {
+    client.close();
+  }
+}
+
+Future<void> _runDoctorCli(ArgResults cmd) async {
+  final baseUrl = cmd['url'] as String;
+  final doPing = cmd['ping'] as bool;
+  final client = HttpClient();
+  try {
+    stdout.writeln(
+      doPing
+          ? '🔍 Checking Antigravity Brain auth, models, MCP & running live quota ping...'
+          : '🔍 Checking Antigravity Brain auth, models & MCP...',
+    );
+    final data = doPing
+        ? await _httpJson(client, 'POST', '$baseUrl/api/brain/ping', body: {})
+        : await _httpJson(client, 'GET', '$baseUrl/api/brain');
+    stdout.writeln('  CLI Installed      : ${data["cliInstalled"]}');
+    stdout.writeln(
+      '  Login Status       : ${data["loggedIn"] == true ? "✅ Logged In" : "❌ Not Logged In"} '
+      '(${data["accountEmail"] ?? ""} ${data["authMethod"] ?? ""})',
+    );
+    stdout.writeln('  Server Default Mdl : ${data["defaultModelLabel"]}');
+    stdout.writeln(
+      '  Model Override     : ${(data["selectedModelOverride"] as String? ?? "").isEmpty ? "(Using Server Default)" : data["selectedModelOverride"]}',
+    );
+    stdout.writeln(
+      '  MCP Bridge (lan)   : ${data["mcpRegistered"] == true ? "✅ Registered" : "⚠️ Not Registered"}',
+    );
+    stdout.writeln(
+      '  Quota / Live Check : [${data["quotaStatus"]}] ${data["quotaMessage"]}',
+    );
+    final models = data['availableModels'] as List<dynamic>? ?? [];
+    stdout.writeln('  Available Models   : ${models.length} models ready');
+    stdout.writeln(
+      '  Cumulative Usage   : ${data["cumulativeTurns"]} turns '
+      '(in=${data["cumulativeInputTokens"]}, out=${data["cumulativeOutputTokens"]}, thinking=${data["cumulativeThinkingTokens"]})',
+    );
   } finally {
     client.close();
   }

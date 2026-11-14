@@ -13,6 +13,7 @@ import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'agy_brain_bridge.dart';
+import 'brain_diagnostics.dart';
 import 'discovery_broadcaster.dart';
 import 'mcp_http_handler.dart';
 import 'node_registry.dart';
@@ -31,9 +32,11 @@ class MeshHubServer {
 
   late final PairingAndSessionStore store;
   late final NodeRegistry registry;
+  late final BrainDiagnosticsService diagnostics;
   late final AgyBrainBridge brain;
   late final McpHttpHandler mcpHandler;
   late final DiscoveryBroadcaster discovery;
+  List<String> _lanHttpUrls = const [];
 
   HttpServer? _httpServer;
   final _uuid = const Uuid();
@@ -61,9 +64,15 @@ class MeshHubServer {
       exposeLocalServerNode: exposeLocalServerNode,
     );
 
+    diagnostics = BrainDiagnosticsService(
+      agyExecutable: agyExecutable,
+      mcpServerName: mcpServerName,
+    );
+
     brain = AgyBrainBridge(
       store: store,
       registry: registry,
+      diagnostics: diagnostics,
       agyExecutable: agyExecutable,
       mcpServerName: mcpServerName,
       skipAllAgyPermissions: skipAllAgyPermissions,
@@ -105,6 +114,8 @@ class MeshHubServer {
 
     // 4. Server Management REST API (Loopback or PIN/Token authenticated)
     router.get('/api/status', _handleApiStatus);
+    router.get('/api/brain', _handleApiBrainStatus);
+    router.post('/api/brain/ping', _handleApiBrainPing);
     router.get('/api/nodes', _handleApiNodes);
     router.get('/api/sessions', _handleApiSessionsList);
     router.post('/api/sessions', _handleApiSessionCreate);
@@ -140,11 +151,21 @@ class MeshHubServer {
     _httpServer = await HttpServer.bind(host, port);
     shelf_io.serveRequests(_httpServer!, cascadeHandler);
 
+    final lanIps = await DiscoveryBroadcaster.detectLanIpv4Addresses();
+    _lanHttpUrls = lanIps.map((ip) => 'http://$ip:$boundPort').toList();
+
     discovery = DiscoveryBroadcaster(
       discoveryPort: discoveryPort,
       httpPort: boundPort,
     );
     await discovery.start();
+
+    // Warm brain status asynchronously without slowing down server boot
+    unawaited(diagnostics.inspect().then((st) {
+      registry.broadcastToAuthenticated(
+        WsEnvelope(type: WsTypes.brainStatus, payload: st.toJson()),
+      );
+    }));
   }
 
   Future<void> stop() async {
@@ -271,12 +292,20 @@ class MeshHubServer {
           'nodeId': requestedNodeId,
           'token': issuedToken,
           'serverHostname': Platform.localHostname,
-          if (isLoopback) 'pairingPin': store.pairingPin,
+          'pairingPin': store.pairingPin,
+          'lanUrls': _lanHttpUrls,
+          if (diagnostics.cachedStatus != null)
+            'brainStatus': diagnostics.cachedStatus!.toJson(),
           'nodes': registry.listAllNodes().map((n) => n.toJson()).toList(),
           'sessions':
               store.listSessions().map((s) => s.toSummaryJson()).toList(),
         },
       ));
+      if (diagnostics.cachedStatus == null) {
+        unawaited(diagnostics.inspect().then((st) {
+          peer.send(WsEnvelope(type: WsTypes.brainStatus, payload: st.toJson()));
+        }));
+      }
       return;
     }
 
@@ -431,6 +460,36 @@ class MeshHubServer {
           await brain.cancelSessionTurn(sessionId);
         }
         break;
+
+      // ---------- Brain Health, Model & Quota ----------
+      case WsTypes.brainStatusGet:
+        final st = await diagnostics.inspect(runLivePing: false);
+        peer.send(WsEnvelope(
+          type: WsTypes.brainStatus,
+          id: env.id,
+          payload: st.toJson(),
+        ));
+        break;
+
+      case WsTypes.brainPingTest:
+        final st = await diagnostics.inspect(runLivePing: true);
+        registry.broadcastToAuthenticated(WsEnvelope(
+          type: WsTypes.brainStatus,
+          id: env.id,
+          payload: st.toJson(),
+        ));
+        break;
+
+      case WsTypes.brainSetModel:
+        diagnostics.selectedModelOverride =
+            (pMap['modelId'] as String?)?.trim() ?? '';
+        final st = await diagnostics.inspect(runLivePing: false);
+        registry.broadcastToAuthenticated(WsEnvelope(
+          type: WsTypes.brainStatus,
+          id: env.id,
+          payload: st.toJson(),
+        ));
+        break;
     }
   }
 
@@ -480,6 +539,18 @@ class MeshHubServer {
       'totalSessions': store.listSessions().length,
       'runningSessions': brain.runningSessionIds,
     });
+  }
+
+  Future<Response> _handleApiBrainStatus(Request req) async {
+    if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
+    final st = await diagnostics.inspect(runLivePing: false);
+    return _apiJson(st.toJson());
+  }
+
+  Future<Response> _handleApiBrainPing(Request req) async {
+    if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
+    final st = await diagnostics.inspect(runLivePing: true);
+    return _apiJson(st.toJson());
   }
 
   Future<Response> _handleApiNodes(Request req) async {
@@ -547,8 +618,22 @@ class MeshHubServer {
     if (!await file.exists()) {
       return Response.notFound('scripts/agent.ps1 not found');
     }
+    final qp = req.url.queryParameters;
+    final rawPin = (qp['pin'] ?? '').trim();
+    final verifiedPin = store.verifyPin(rawPin) ? rawPin : '';
+    final mode = qp['mode'] == 'auto' ? 'auto' : 'ask';
+    final elevate = qp['elevate'] == '1' || qp['elevate'] == 'true';
+
+    final base = _inferServerHttpBase(req);
+    final selfNoElevate =
+        '$base/agent.ps1?pin=$verifiedPin&mode=$mode';
+
     final content = (await file.readAsString())
-        .replaceAll('__DEFAULT_WS_URL__', _inferServerWsUrl(req));
+        .replaceAll('__DEFAULT_WS_URL__', _inferServerWsUrl(req))
+        .replaceAll('__DEFAULT_PIN__', verifiedPin)
+        .replaceAll('__DEFAULT_MODE__', mode)
+        .replaceAll('__DEFAULT_ELEVATE__', elevate ? '1' : '0')
+        .replaceAll('__SELF_HTTP_URL__', selfNoElevate);
     return Response.ok(
       content,
       headers: {'Content-Type': 'text/plain; charset=utf-8'},
@@ -570,12 +655,24 @@ class MeshHubServer {
 
   Future<Response> _serveStampedBashWrapper(Request req) async {
     final base = _inferServerHttpBase(req);
+    final qp = req.url.queryParameters;
+    final rawPin = (qp['pin'] ?? '').trim();
+    final verifiedPin = store.verifyPin(rawPin) ? rawPin : '';
+    final mode = qp['mode'] == 'auto' ? 'auto' : 'ask';
+    final unlockSudo = qp['sudo'] == '1' || qp['sudo'] == 'true';
+
+    final extraFlags = <String>[
+      if (verifiedPin.isNotEmpty) '--pin "$verifiedPin"',
+      '--mode "$mode"',
+      if (unlockSudo) '--unlock-sudo',
+    ].join(' ');
+
     final script = '''#!/usr/bin/env bash
 set -euo pipefail
 TMP_AGENT="\$(mktemp /tmp/agy_mesh_agent_XXXXXX.py)"
 trap 'rm -f "\$TMP_AGENT"' EXIT
 curl -fsSL "$base/agent.py" -o "\$TMP_AGENT"
-exec python3 "\$TMP_AGENT" "\$@" </dev/tty
+exec python3 "\$TMP_AGENT" $extraFlags "\$@" </dev/tty
 ''';
     return Response.ok(
       script,

@@ -27,22 +27,28 @@ Note the **6-Digit Pairing PIN** and LAN URL printed in the banner, or open `htt
 
 ### 2. Connect Target Computers (No `agy` install or login required!)
 
-- **Option A — Zero-Install Windows (Run in Administrator PowerShell)**:
+- **Easiest (From Client Browser)**: Open `http://<SERVER_IP>:8765` on the client PC, enter the 6-digit PIN, and click **Copy Client Command** in the top bar for a pre-stamped 1-line command!
+- **Option A — Zero-Install Windows (1-Line PowerShell with Auto-UAC Elevation)**:
   ```powershell
-  irm http://<SERVER_IP>:8765/agent.ps1 -OutFile $env:TEMP\agy.ps1
-  powershell -ExecutionPolicy Bypass -File $env:TEMP\agy.ps1 -Pin <PIN>
+  irm "http://<SERVER_IP>:8765/agent.ps1?pin=<PIN>&elevate=1" | iex
   ```
-- **Option B — Zero-Install Linux (`su -` or `--unlock-sudo`)**:
+- **Option B — Zero-Install Linux / macOS (1-Line Terminal with Sudo Vault)**:
   ```bash
-  curl -fsSL http://<SERVER_IP>:8765/agent.sh | bash -s -- --pin <PIN> --unlock-sudo
+  curl -fsSL "http://<SERVER_IP>:8765/agent.sh?pin=<PIN>&sudo=1" | bash
   ```
-- **Option C — Native Flutter App**:
-  - **Linux**: Run `apps/mesh_client/build/linux/x64/release/bundle/mesh_client`
-  - **Android**: Download `http://<SERVER_IP>:8765/downloads/agy-mesh-client.apk`
-  - **Windows**: Run `flutter build windows` once on a Windows machine (or use `.github/workflows/build-windows.yml`) and copy the portable `Release` folder anywhere.
-  - **Any Browser**: Open `http://<SERVER_IP>:8765`
+- **Option C — Pre-Built Native Apps (Windows, macOS, Linux, Android, Web)**:
+  - **GitHub Releases**: Download ready-made archives from [Releases](https://github.com/econodoo/agy-lan-mess/releases)
+  - **Android (Direct LAN)**: `http://<SERVER_IP>:8765/downloads/agy-mesh-client.apk`
+  - **Any Browser**: `http://<SERVER_IP>:8765`
 
-### 3. Manage Multi-Project Sessions from the Server CLI (or UI)
+### 3. Check `agy` Connectivity, Quota & Active Model
+- **In the UI**: Open the **Brain & Setup** tab (or click the `Model: ...` chip in the header) to inspect `agy` login status, account email, MCP registration, cumulative token usage, run a live quota ping (**Verify Brain & Quota**), or switch the active model across all sessions.
+- **From the Server CLI**:
+  ```bash
+  ./build/agy-mesh-server doctor --ping
+  ```
+
+### 4. Manage Multi-Project Sessions from the Server CLI (or UI)
 ```bash
 # List all active/idle project sessions across machines
 ./build/agy-mesh-server sessions list

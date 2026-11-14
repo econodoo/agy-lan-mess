@@ -572,3 +572,116 @@ class FileOpResult {
 
   String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());
 }
+
+class BrainModelOption {
+  final String id;
+  final String label;
+
+  const BrainModelOption({required this.id, required this.label});
+
+  Map<String, dynamic> toJson() => {'id': id, 'label': label};
+
+  factory BrainModelOption.fromJson(Map<String, dynamic> json) =>
+      BrainModelOption(
+        id: json['id'] as String? ?? '',
+        label: json['label'] as String? ?? '',
+      );
+}
+
+class BrainHealthStatus {
+  final String checkedAt;
+  final bool cliInstalled;
+  final bool loggedIn;
+  final String accountEmail;
+  final String authMethod;
+  final String defaultModelLabel;
+  final String selectedModelOverride;
+  final List<BrainModelOption> availableModels;
+  final String quotaStatus; // healthy | exhausted | unchecked | error
+  final String quotaMessage;
+  final int? lastPingLatencyMs;
+  final bool mcpRegistered;
+  final int cumulativeTurns;
+  final int cumulativeInputTokens;
+  final int cumulativeOutputTokens;
+  final int cumulativeThinkingTokens;
+
+  const BrainHealthStatus({
+    required this.checkedAt,
+    this.cliInstalled = false,
+    this.loggedIn = false,
+    this.accountEmail = '',
+    this.authMethod = '',
+    this.defaultModelLabel = '',
+    this.selectedModelOverride = '',
+    this.availableModels = const [],
+    this.quotaStatus = 'unchecked',
+    this.quotaMessage = 'Click "Verify Brain & Quota" to run a live turn test.',
+    this.lastPingLatencyMs,
+    this.mcpRegistered = false,
+    this.cumulativeTurns = 0,
+    this.cumulativeInputTokens = 0,
+    this.cumulativeOutputTokens = 0,
+    this.cumulativeThinkingTokens = 0,
+  });
+
+  int get cumulativeTotalTokens =>
+      cumulativeInputTokens + cumulativeOutputTokens + cumulativeThinkingTokens;
+
+  String get effectiveModelDisplay {
+    if (selectedModelOverride.isNotEmpty) {
+      for (final m in availableModels) {
+        if (m.id == selectedModelOverride) return m.label;
+      }
+      return selectedModelOverride;
+    }
+    return defaultModelLabel.isNotEmpty ? defaultModelLabel : 'Default';
+  }
+
+  Map<String, dynamic> toJson() => {
+        'checkedAt': checkedAt,
+        'cliInstalled': cliInstalled,
+        'loggedIn': loggedIn,
+        'accountEmail': accountEmail,
+        'authMethod': authMethod,
+        'defaultModelLabel': defaultModelLabel,
+        'selectedModelOverride': selectedModelOverride,
+        'availableModels': availableModels.map((m) => m.toJson()).toList(),
+        'quotaStatus': quotaStatus,
+        'quotaMessage': quotaMessage,
+        if (lastPingLatencyMs != null) 'lastPingLatencyMs': lastPingLatencyMs,
+        'mcpRegistered': mcpRegistered,
+        'cumulativeTurns': cumulativeTurns,
+        'cumulativeInputTokens': cumulativeInputTokens,
+        'cumulativeOutputTokens': cumulativeOutputTokens,
+        'cumulativeThinkingTokens': cumulativeThinkingTokens,
+      };
+
+  factory BrainHealthStatus.fromJson(Map<String, dynamic> json) =>
+      BrainHealthStatus(
+        checkedAt: json['checkedAt'] as String? ?? '',
+        cliInstalled: json['cliInstalled'] as bool? ?? false,
+        loggedIn: json['loggedIn'] as bool? ?? false,
+        accountEmail: json['accountEmail'] as String? ?? '',
+        authMethod: json['authMethod'] as String? ?? '',
+        defaultModelLabel: json['defaultModelLabel'] as String? ?? '',
+        selectedModelOverride: json['selectedModelOverride'] as String? ?? '',
+        availableModels: (json['availableModels'] as List<dynamic>?)
+                ?.map((e) => BrainModelOption.fromJson(
+                      Map<String, dynamic>.from(e as Map),
+                    ))
+                .toList() ??
+            const [],
+        quotaStatus: json['quotaStatus'] as String? ?? 'unchecked',
+        quotaMessage: json['quotaMessage'] as String? ?? '',
+        lastPingLatencyMs: (json['lastPingLatencyMs'] as num?)?.toInt(),
+        mcpRegistered: json['mcpRegistered'] as bool? ?? false,
+        cumulativeTurns: (json['cumulativeTurns'] as num?)?.toInt() ?? 0,
+        cumulativeInputTokens:
+            (json['cumulativeInputTokens'] as num?)?.toInt() ?? 0,
+        cumulativeOutputTokens:
+            (json['cumulativeOutputTokens'] as num?)?.toInt() ?? 0,
+        cumulativeThinkingTokens:
+            (json['cumulativeThinkingTokens'] as num?)?.toInt() ?? 0,
+      );
+}

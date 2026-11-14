@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:mesh_protocol/mesh_protocol.dart';
 
 import '../state/mesh_app_controller.dart';
+import 'widgets/brain_and_rollout_panel.dart';
 import 'widgets/markdown_message_view.dart';
 import 'widgets/new_session_dialog.dart';
 
@@ -16,7 +17,7 @@ class MeshHomePage extends StatefulWidget {
 }
 
 class _MeshHomePageState extends State<MeshHomePage> {
-  int _activeTab = 0; // 0 = Sessions & Brain Chat, 1 = LAN Computers & Privilege, 2 = Local Audit
+  int _activeTab = 0; // 0 = Sessions, 1 = Computers, 2 = Brain & Setup, 3 = Local Audit
   final _promptCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
 
@@ -48,6 +49,30 @@ class _MeshHomePageState extends State<MeshHomePage> {
         initialNodeId: preselectedNodeId,
         initialWorkspacePath: preselectedPath,
         initialTitle: preselectedTitle,
+      ),
+    );
+  }
+
+  void _openClientRolloutDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Join This Computer to AGY LAN Mesh'),
+        content: SizedBox(
+          width: 660,
+          child: SingleChildScrollView(
+            child: ListenableBuilder(
+              listenable: c,
+              builder: (_, _) => ClientRolloutCard(controller: c),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Close'),
+          ),
+        ],
       ),
     );
   }
@@ -243,6 +268,27 @@ class _MeshHomePageState extends State<MeshHomePage> {
                     },
                   ),
                 ],
+                if (c.brainHealth != null && isWide) ...[
+                  const SizedBox(width: 8),
+                  ActionChip(
+                    avatar: Icon(
+                      c.brainHealth!.loggedIn
+                          ? Icons.psychology
+                          : Icons.warning_amber_rounded,
+                      size: 16,
+                      color: c.brainHealth!.loggedIn
+                          ? Colors.greenAccent.shade400
+                          : Colors.redAccent,
+                    ),
+                    label: Text(
+                      c.brainHealth!.loggedIn
+                          ? 'Model: ${c.brainHealth!.effectiveModelDisplay}'
+                          : 'AGY Not Logged In',
+                    ),
+                    tooltip: 'Check AGY login, quota & active model',
+                    onPressed: () => setState(() => _activeTab = 2),
+                  ),
+                ],
                 if (runningCount > 0) ...[
                   const SizedBox(width: 8),
                   Chip(
@@ -258,6 +304,21 @@ class _MeshHomePageState extends State<MeshHomePage> {
               ],
             ),
             actions: [
+              if (c.isConnected)
+                Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: isWide
+                      ? FilledButton.tonalIcon(
+                          onPressed: _openClientRolloutDialog,
+                          icon: const Icon(Icons.terminal, size: 17),
+                          label: const Text('Copy Client Command'),
+                        )
+                      : IconButton(
+                          tooltip: 'Copy Client Install Command',
+                          onPressed: _openClientRolloutDialog,
+                          icon: const Icon(Icons.terminal),
+                        ),
+                ),
               IconButton(
                 tooltip: 'New Project Session',
                 onPressed: c.isConnected ? () => _openNewSessionDialog() : null,
@@ -309,6 +370,16 @@ class _MeshHomePageState extends State<MeshHomePage> {
                           ),
                           NavigationRailDestination(
                             icon: Badge(
+                              isLabelVisible:
+                                  c.brainHealth != null && !c.brainHealth!.loggedIn,
+                              label: const Text('!'),
+                              child: const Icon(Icons.psychology_outlined),
+                            ),
+                            selectedIcon: const Icon(Icons.psychology),
+                            label: const Text('Brain & Setup'),
+                          ),
+                          NavigationRailDestination(
+                            icon: Badge(
                               isLabelVisible: c.pendingApprovals.isNotEmpty,
                               label: Text('${c.pendingApprovals.length}'),
                               child: const Icon(Icons.shield_outlined),
@@ -332,6 +403,7 @@ class _MeshHomePageState extends State<MeshHomePage> {
                         children: [
                           _buildChatWorkspacePane(isWide: isWide),
                           _buildComputersAndPrivilegePane(),
+                          _buildBrainAndSetupPane(),
                           _buildAuditPane(),
                         ],
                       ),
@@ -359,6 +431,15 @@ class _MeshHomePageState extends State<MeshHomePage> {
                         child: const Icon(Icons.devices_outlined),
                       ),
                       label: 'Computers',
+                    ),
+                    NavigationDestination(
+                      icon: Badge(
+                        isLabelVisible:
+                            c.brainHealth != null && !c.brainHealth!.loggedIn,
+                        label: const Text('!'),
+                        child: const Icon(Icons.psychology_outlined),
+                      ),
+                      label: 'Brain & Setup',
                     ),
                     NavigationDestination(
                       icon: Badge(
@@ -739,16 +820,32 @@ class _MeshHomePageState extends State<MeshHomePage> {
                               style: TextStyle(color: cs.onSurfaceVariant),
                             ),
                             const SizedBox(height: 16),
-                            OutlinedButton.icon(
-                              onPressed: c.isConnected
-                                  ? () => _openNewSessionDialog()
-                                  : _openConnectionSheet,
-                              icon: const Icon(Icons.create_new_folder_outlined),
-                              label: Text(
-                                c.isConnected
-                                    ? 'Pin a Project Folder on a LAN Computer'
-                                    : 'Connect to LAN Hub First',
-                              ),
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 10,
+                              alignment: WrapAlignment.center,
+                              children: [
+                                OutlinedButton.icon(
+                                  onPressed: c.isConnected
+                                      ? () => _openNewSessionDialog()
+                                      : _openConnectionSheet,
+                                  icon: const Icon(
+                                      Icons.create_new_folder_outlined),
+                                  label: Text(
+                                    c.isConnected
+                                        ? 'Pin a Project Folder on a LAN Computer'
+                                        : 'Connect to LAN Hub First',
+                                  ),
+                                ),
+                                if (c.isConnected)
+                                  FilledButton.tonalIcon(
+                                    onPressed: _openClientRolloutDialog,
+                                    icon: const Icon(Icons.terminal, size: 18),
+                                    label: const Text(
+                                      'Copy 1-Line Command for This Client',
+                                    ),
+                                  ),
+                              ],
                             ),
                           ],
                         ),
@@ -902,6 +999,10 @@ class _MeshHomePageState extends State<MeshHomePage> {
           ),
           const SizedBox(height: 18),
         ],
+        if (c.isConnected) ...[
+          ClientRolloutCard(controller: c),
+          const SizedBox(height: 18),
+        ],
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
@@ -976,6 +1077,19 @@ class _MeshHomePageState extends State<MeshHomePage> {
               ),
             );
           }),
+      ],
+    );
+  }
+
+  // ---------------- Brain Health & Client Rollout Pane ----------------
+
+  Widget _buildBrainAndSetupPane() {
+    return ListView(
+      padding: const EdgeInsets.all(18),
+      children: [
+        BrainDiagnosticsCard(controller: c),
+        const SizedBox(height: 18),
+        ClientRolloutCard(controller: c),
       ],
     );
   }

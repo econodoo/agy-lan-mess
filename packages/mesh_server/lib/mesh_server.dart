@@ -1,6 +1,7 @@
 library;
 
 export 'src/agy_brain_bridge.dart';
+export 'src/brain_diagnostics.dart';
 export 'src/discovery_broadcaster.dart';
 export 'src/hub_server.dart';
 export 'src/mcp_http_handler.dart';

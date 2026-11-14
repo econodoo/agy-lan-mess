@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:mesh_protocol/mesh_protocol.dart';
 import 'package:uuid/uuid.dart';
 
+import 'brain_diagnostics.dart';
 import 'mcp_http_handler.dart';
 import 'node_registry.dart';
 import 'pairing_store.dart';
@@ -12,6 +13,7 @@ import 'pairing_store.dart';
 class AgyBrainBridge {
   final PairingAndSessionStore store;
   final NodeRegistry registry;
+  final BrainDiagnosticsService diagnostics;
   final String agyExecutable;
   final String mcpServerName;
   final bool skipAllAgyPermissions;
@@ -24,6 +26,7 @@ class AgyBrainBridge {
   AgyBrainBridge({
     required this.store,
     required this.registry,
+    required this.diagnostics,
     this.agyExecutable = 'agy',
     this.mcpServerName = 'lan-mesh',
     this.skipAllAgyPermissions = false,
@@ -166,6 +169,10 @@ class AgyBrainBridge {
       contextualized,
       '--output-format',
       'stream-json',
+      if (diagnostics.selectedModelOverride.isNotEmpty) ...[
+        '--model',
+        diagnostics.selectedModelOverride,
+      ],
       if (updatedSession.agyConversationId != null &&
           updatedSession.agyConversationId!.isNotEmpty) ...[
         '--conversation',
@@ -274,6 +281,14 @@ class AgyBrainBridge {
           if (cid != null && cid.isNotEmpty) {
             discoveredConvId = cid;
             store.updateSessionMeta(sessionId, agyConversationId: cid);
+          }
+          final usage = res['usage'] as Map<String, dynamic>?;
+          if (usage != null) {
+            diagnostics.recordTurnUsage(
+              inputTokens: (usage['input_tokens'] as num?)?.toInt() ?? 0,
+              outputTokens: (usage['output_tokens'] as num?)?.toInt() ?? 0,
+              thinkingTokens: (usage['thinking_tokens'] as num?)?.toInt() ?? 0,
+            );
           }
           final fullResp = res['response'] as String? ?? '';
           if (accumulatedText.trim().isEmpty && fullResp.isNotEmpty) {

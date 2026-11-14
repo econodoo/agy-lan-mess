@@ -49,7 +49,10 @@ class MeshAppController extends ChangeNotifier {
   String hostname = '';
   String token = '';
   String pairingPinInput = '';
-  String? serverLoopbackPin; // Populated when connected from Brain Server localhost
+  String? serverLoopbackPin; // Populated for all authenticated sessions
+  List<String> serverLanUrls = [];
+  BrainHealthStatus? brainHealth;
+  bool isPingingBrain = false;
   String serverHostname = '';
   String privilegeLevel = PrivilegeLevels.standard;
   String approvalMode = ApprovalModes.askForElevated;
@@ -232,6 +235,15 @@ class MeshAppController extends ChangeNotifier {
         token = p['token'] as String? ?? token;
         serverHostname = p['serverHostname'] as String? ?? 'AGY Hub';
         serverLoopbackPin = p['pairingPin'] as String?;
+        serverLanUrls = (p['lanUrls'] as List<dynamic>?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const [];
+        if (p['brainStatus'] is Map) {
+          brainHealth = BrainHealthStatus.fromJson(
+            Map<String, dynamic>.from(p['brainStatus'] as Map),
+          );
+        }
         pairingPinInput = '';
         await _prefs?.setString('mesh_node_id', nodeId);
         await _prefs?.setString('mesh_token', token);
@@ -283,6 +295,12 @@ class MeshAppController extends ChangeNotifier {
 
       case WsTypes.chatEvent:
         _handleLiveChatEvent(p);
+        break;
+
+      case WsTypes.brainStatus:
+        isPingingBrain = false;
+        brainHealth = BrainHealthStatus.fromJson(p);
+        notifyListeners();
         break;
 
       case WsTypes.browseRemoteDirResult:
@@ -633,6 +651,45 @@ class MeshAppController extends ChangeNotifier {
       type: WsTypes.chatCancel,
       payload: {'sessionId': sessionId},
     ));
+  }
+
+  // ---------------- Brain Diagnostics, Model & Rollout Helpers ----------------
+
+  void refreshBrainStatus() {
+    _send(const WsEnvelope(type: WsTypes.brainStatusGet));
+  }
+
+  void runLiveBrainQuotaPing() {
+    isPingingBrain = true;
+    notifyListeners();
+    _send(const WsEnvelope(type: WsTypes.brainPingTest));
+  }
+
+  void setBrainModelOverride(String modelId) {
+    _send(WsEnvelope(
+      type: WsTypes.brainSetModel,
+      payload: {'modelId': modelId},
+    ));
+  }
+
+  /// Best HTTP base URL for client rollout commands (uses LAN IP even if opened via 127.0.0.1 on Server!).
+  String get bestRolloutHttpBaseUrl {
+    try {
+      final parsed = Uri.parse(wsUrl);
+      final isLoopback = parsed.host == '127.0.0.1' ||
+          parsed.host == 'localhost' ||
+          parsed.host == '::1';
+      if (isLoopback && serverLanUrls.isNotEmpty) {
+        return serverLanUrls.first;
+      }
+      final httpScheme = parsed.scheme == 'wss' ? 'https' : 'http';
+      final portPart = parsed.hasPort ? ':${parsed.port}' : '';
+      return '$httpScheme://${parsed.host}$portPart';
+    } catch (_) {
+      return serverLanUrls.isNotEmpty
+          ? serverLanUrls.first
+          : 'http://127.0.0.1:8765';
+    }
   }
 
   Future<FileOpResult> browseRemoteDirectory(String targetNodeId, String path) {

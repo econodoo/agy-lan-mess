@@ -9,14 +9,18 @@
 #>
 param(
     [string]$Server = "__DEFAULT_WS_URL__",
-    [string]$Pin = "",
+    [string]$Pin = "__DEFAULT_PIN__",
     [ValidateSet("ask", "auto")]
-    [string]$Mode = "ask",
+    [string]$Mode = "__DEFAULT_MODE__",
     [string]$Cwd = (Get-Location).Path,
     [switch]$Elevate
 )
 
 $ErrorActionPreference = "Stop"
+if ($Pin.StartsWith("__DEFAULT")) { $Pin = "" }
+if ($Mode -notin @("ask", "auto")) { $Mode = "ask" }
+$StampedElevate = ("__DEFAULT_ELEVATE__" -eq "1")
+$SelfHttpUrl = "__SELF_HTTP_URL__"
 
 function Test-IsAdmin {
     $current = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -24,12 +28,18 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-if ($Elevate -and -not (Test-IsAdmin)) {
+if (($Elevate -or $StampedElevate) -and -not (Test-IsAdmin)) {
     Write-Host "🔼 Relaunching PowerShell Agent as Administrator..." -ForegroundColor Cyan
-    $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode $Mode -Cwd `"$Cwd`""
-    if ($Server -and -not $Server.StartsWith("__DEFAULT")) { $argList += " -Server `"$Server`"" }
-    if ($Pin) { $argList += " -Pin `"$Pin`"" }
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
+    if ($PSCommandPath) {
+        $argList = "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode $Mode -Cwd `"$Cwd`""
+        if ($Server -and -not $Server.StartsWith("__DEFAULT")) { $argList += " -Server `"$Server`"" }
+        if ($Pin) { $argList += " -Pin `"$Pin`"" }
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
+    } elseif (-not $SelfHttpUrl.StartsWith("__SELF")) {
+        $safeCwd = $Cwd.Replace("'", "''")
+        $iexCmd = "Set-Location '$safeCwd'; irm '$SelfHttpUrl' | iex"
+        Start-Process powershell.exe -Verb RunAs -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $iexCmd)
+    }
     exit
 }
 
