@@ -159,9 +159,21 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-      - uses: android-actions/setup-android@v3
-      - name: Accept Android SDK Licenses
-        run: yes | sdkmanager --licenses > /dev/null || true
+      - name: Provision Android SDK & Accept Licenses
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/android-sdk}}"
+          mkdir -p "$SDK_ROOT"
+          CMDLINE_BIN="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+          if [ -z "$CMDLINE_BIN" ]; then
+            curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
+            mkdir -p "$SDK_ROOT/cmdline-tools" /tmp/cmdtools_extract
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools_extract
+            mv /tmp/cmdtools_extract/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+            CMDLINE_BIN="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          yes | "$CMDLINE_BIN" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -182,18 +194,20 @@ jobs:
     needs: [build-windows, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
-      - name: Create/Update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: AGY LAN Mesh Build #${{ github.run_number }} (Windows, Linux, macOS, Android)
-          generate_release_notes: true
-          files: |
-            release-assets/agy-lan-mesh-windows-x64.zip
-            release-assets/agy-lan-mesh-linux-x64.tar.gz
-            release-assets/agy-lan-mesh-macos.zip
-            release-assets/agy-lan-mesh-android.apk
+      - name: Publish GitHub Release via gh CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" \
+            release-assets/agy-lan-mesh-windows-x64.zip \
+            release-assets/agy-lan-mesh-linux-x64.tar.gz \
+            release-assets/agy-lan-mesh-macos.zip \
+            release-assets/agy-lan-mesh-android.apk \
+            --title "AGY LAN Mesh $TAG (Windows, Linux, macOS, Android)" \
+            --generate-notes
