@@ -1,4 +1,4 @@
-library mesh_server;
+library;
 
 export 'src/agy_brain_bridge.dart';
 export 'src/discovery_broadcaster.dart';

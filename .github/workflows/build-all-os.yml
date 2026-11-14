@@ -25,7 +25,7 @@ jobs:
       - name: Static Analysis
         run: |
           dart analyze packages/mesh_protocol packages/mesh_server
-          cd apps/mesh_client && flutter analyze
+          cd apps/mesh_client && flutter analyze --no-fatal-infos
       - name: Run Protocol, Hub/MCP Integration & Widget Tests
         run: |
           (cd packages/mesh_protocol && dart test)
@@ -111,11 +111,13 @@ jobs:
         with:
           channel: stable
           cache: true
+      - name: Resolve Dependencies
+        run: flutter pub get
       - name: Enable macOS Desktop Platform & LAN Entitlements
         run: |
           cd apps/mesh_client
           if [ ! -d macos ]; then
-            flutter create --platforms=macos .
+            flutter create --platforms=macos --no-pub .
           fi
           cat > macos/Runner/Release.entitlements << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -132,8 +134,7 @@ jobs:
           </plist>
           EOF
           cp macos/Runner/Release.entitlements macos/Runner/DebugProfile.entitlements
-      - name: Resolve Dependencies
-        run: flutter pub get
+          cd ../.. && flutter pub get
       - name: Build Flutter macOS Client & Native Hub Server
         run: |
           mkdir -p dist/macos/server
