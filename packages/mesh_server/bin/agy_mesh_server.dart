@@ -80,7 +80,23 @@ Future<void> main(List<String> arguments) async {
   final cmd = results.command;
   if (cmd == null || cmd.name == 'start') {
     final sArgs = cmd ?? startParser.parse([]);
-    await _runStart(sArgs);
+    final done = Completer<void>();
+    runZonedGuarded(
+      () async {
+        try {
+          await _runStart(sArgs);
+          done.complete();
+        } catch (e, st) {
+          stderr.writeln('[Hub] Startup error: $e\n$st');
+          exit(1);
+        }
+      },
+      (error, stack) {
+        // Keep the Hub Server running across transient socket/network errors.
+        stderr.writeln('[Hub] Ignored transient async error: $error');
+      },
+    );
+    await done.future;
   } else if (cmd.name == 'sessions') {
     await _runSessionsCli(cmd);
   } else if (cmd.name == 'nodes') {

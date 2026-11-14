@@ -132,7 +132,7 @@ class LocalNodeDriver {
             }
           } catch (_) {}
         }
-      });
+      }, onError: (Object _, StackTrace _) {});
 
       final probeBytes = utf8.encode(DiscoveryBeacon.magicProbe);
       socket.send(probeBytes, InternetAddress('255.255.255.255'), discoveryPort);

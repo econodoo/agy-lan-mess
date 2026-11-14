@@ -26,16 +26,23 @@ class DiscoveryBroadcaster {
         reuseAddress: true,
       );
       _socket!.broadcastEnabled = true;
-      _socket!.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final dg = _socket?.receive();
-          if (dg == null) return;
-          final msg = utf8.decode(dg.data, allowMalformed: true).trim();
-          if (msg.startsWith(DiscoveryBeacon.magicProbe)) {
-            _sendBeaconTo(dg.address, dg.port);
+      _socket!.listen(
+        (event) {
+          if (event == RawSocketEvent.read) {
+            try {
+              final dg = _socket?.receive();
+              if (dg == null) return;
+              final msg = utf8.decode(dg.data, allowMalformed: true).trim();
+              if (msg.startsWith(DiscoveryBeacon.magicProbe)) {
+                _sendBeaconTo(dg.address, dg.port);
+              }
+            } catch (_) {}
           }
-        }
-      });
+        },
+        onError: (Object _, StackTrace _) {
+          // Ignore transient OS network/Wi-Fi roaming errors (e.g. errno 101).
+        },
+      );
 
       _periodicBeacon = Timer.periodic(const Duration(seconds: 4), (_) {
         _broadcastBeacon();
