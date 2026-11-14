@@ -184,7 +184,16 @@ jobs:
       - name: Resolve Dependencies & Build Release APK
         run: |
           flutter pub get
-          cd apps/mesh_client && flutter build apk --release
+          cd apps/mesh_client
+          rm -rf android
+          flutter create --platforms=android --org com.agylan --project-name mesh_client --no-pub .
+          sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"\/>\n    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"\/>\n    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"\/>\n    <application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's/android:label="mesh_client"/android:label="AGY LAN Mesh"/' android/app/src/main/AndroidManifest.xml
+          echo "org.gradle.jvmargs=-Xmx3G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
+          flutter build apk --release 2>&1 | tee /tmp/apk_build.log || {
+            tail -n 30 /tmp/apk_build.log | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
           cp build/app/outputs/flutter-apk/app-release.apk ../../agy-lan-mesh-android.apk
       - uses: actions/upload-artifact@v4
         with:
@@ -193,7 +202,7 @@ jobs:
 
   release:
     name: Publish Multi-OS Release Assets
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success'
     needs: [build-windows, build-linux, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
@@ -207,10 +216,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v1.0.${{ github.run_number }}"
-          gh release create "$TAG" \
-            release-assets/agy-lan-mesh-windows-x64.zip \
-            release-assets/agy-lan-mesh-linux-x64.tar.gz \
-            release-assets/agy-lan-mesh-macos.zip \
-            release-assets/agy-lan-mesh-android.apk \
-            --title "AGY LAN Mesh $TAG (Windows, Linux, macOS, Android)" \
+          ls -lh release-assets/
+          gh release create "$TAG" release-assets/* \
+            --title "AGY LAN Mesh $TAG (Windows, macOS, Linux, Android)" \
             --generate-notes
