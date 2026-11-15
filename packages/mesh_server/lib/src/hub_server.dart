@@ -81,6 +81,7 @@ class MeshHubServer {
     registry.onNodeAwaitingApproval = (nodeId, _) {
       brain.notifyNodeAwaitingApproval(nodeId);
     };
+    registry.onDetachedTaskCompleted = brain.handleAsyncTaskCompletion;
 
     mcpHandler = McpHttpHandler(
       registry: registry,
@@ -117,6 +118,9 @@ class MeshHubServer {
     router.get('/api/brain', _handleApiBrainStatus);
     router.post('/api/brain/ping', _handleApiBrainPing);
     router.get('/api/nodes', _handleApiNodes);
+    router.get('/api/tasks', _handleApiTasksList);
+    router.get('/api/tasks/<id>', _handleApiTaskDetail);
+    router.post('/api/tasks/<id>/kill', _handleApiTaskKill);
     router.get('/api/sessions', _handleApiSessionsList);
     router.post('/api/sessions', _handleApiSessionCreate);
     router.post('/api/sessions/<id>/cancel', _handleApiSessionCancel);
@@ -193,7 +197,7 @@ class MeshHubServer {
     channel.stream.listen(
       (dynamic raw) {
         if (raw is! String) return;
-        peer.lastSeen = DateTime.now().toUtc();
+        registry.touchPeerHeartbeat(peer);
         WsEnvelope env;
         try {
           env = WsEnvelope.decode(raw);
@@ -297,6 +301,11 @@ class MeshHubServer {
           if (diagnostics.cachedStatus != null)
             'brainStatus': diagnostics.cachedStatus!.toJson(),
           'nodes': registry.listAllNodes().map((n) => n.toJson()).toList(),
+          'tasks': registry
+              .listTasks(includeCompleted: true)
+              .take(25)
+              .map((t) => t.toJson())
+              .toList(),
           'sessions':
               store.listSessions().map((s) => s.toSummaryJson()).toList(),
         },
@@ -331,8 +340,19 @@ class MeshHubServer {
         }
         break;
 
+      case WsTypes.rpcExecHeartbeat:
+        registry.handleExecHeartbeat(pMap);
+        break;
+
       case WsTypes.rpcExecResult:
         registry.handleExecResult(pMap);
+        break;
+
+      case WsTypes.taskKillRequest:
+        final taskId = pMap['taskId'] as String? ?? '';
+        if (taskId.isNotEmpty) {
+          registry.killTask(taskId);
+        }
         break;
 
       case WsTypes.rpcFileOpResult:
@@ -558,6 +578,39 @@ class MeshHubServer {
     return _apiJson({
       'nodes': registry.listAllNodes().map((n) => n.toJson()).toList(),
     });
+  }
+
+  Future<Response> _handleApiTasksList(Request req) async {
+    if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
+    final activeOnly = req.url.queryParameters['active'] == '1';
+    return _apiJson({
+      'tasks': registry
+          .listTasks(includeCompleted: !activeOnly)
+          .map((t) => t.toJson())
+          .toList(),
+    });
+  }
+
+  Future<Response> _handleApiTaskDetail(Request req, String id) async {
+    if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
+    final waitSec =
+        (int.tryParse(req.url.queryParameters['wait'] ?? '0') ?? 0)
+            .clamp(0, 120);
+    final outcome = await registry.waitForTask(id, waitSec: waitSec);
+    if (outcome == null) {
+      return Response.notFound(jsonEncode({'error': 'Unknown taskId: $id'}));
+    }
+    return _apiJson({
+      'completed': outcome.completed,
+      'task': outcome.taskInfo.toJson(),
+      if (outcome.result != null) 'result': outcome.result!.toJson(),
+    });
+  }
+
+  Future<Response> _handleApiTaskKill(Request req, String id) async {
+    if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
+    final killed = registry.killTask(id);
+    return _apiJson({'ok': true, 'killed': killed});
   }
 
   Future<Response> _handleApiSessionsList(Request req) async {

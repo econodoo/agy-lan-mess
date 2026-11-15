@@ -140,8 +140,78 @@ while ($true) {
             }
         }
 
+        $activeJobs = @{}
+        $recvBuf = New-Object byte[] 16384
+        $recvMs = New-Object System.IO.MemoryStream
+        $recvSeg = New-Object System.ArraySegment[byte](,$recvBuf)
+        $recvTask = $ws.ReceiveAsync($recvSeg, [Threading.CancellationToken]::None)
+
         while ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
-            $raw = Receive-WsText $ws
+            # Check running background jobs & send 5s heartbeats without blocking WebSocket!
+            foreach ($jid in @($activeJobs.Keys)) {
+                $item = $activeJobs[$jid]
+                $job = $item.Job
+                $elapsed = [int]$item.Sw.ElapsedMilliseconds
+                if ($job.State -notin @("Running", "NotStarted")) {
+                    $item.Sw.Stop()
+                    $jobOut = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                    $activeJobs.Remove($jid)
+
+                    $code = if ($jobOut -and $null -ne $jobOut.exitCode) { [int]$jobOut.exitCode } else { 0 }
+                    $outStr = if ($jobOut -and $jobOut.stdout) { [string]$jobOut.stdout } else { "" }
+                    $errStr = if ($jobOut -and $jobOut.stderr) { [string]$jobOut.stderr } else { "" }
+                    Write-Host "[Finished #$($item.ShortId)] exit=$code in $([Math]::Round($elapsed / 1000.0, 2))s" -ForegroundColor Cyan
+                    Send-WsJson $ws @{
+                        type = "rpc.exec_result"
+                        payload = @{
+                            requestId = $jid
+                            exitCode = $code
+                            stdout = $outStr
+                            stderr = $errStr
+                            approved = $true
+                            durationMs = $elapsed
+                        }
+                    }
+                } elseif (($elapsed - $item.LastHbMs) -ge 5000) {
+                    $item.LastHbMs = $elapsed
+                    Send-WsJson $ws @{
+                        type = "rpc.exec_heartbeat"
+                        payload = @{
+                            requestId = $jid
+                            alive = $true
+                            elapsedMs = $elapsed
+                        }
+                    }
+                    if (($elapsed - $item.LastLogMs) -ge 10000) {
+                        $item.LastLogMs = $elapsed
+                        Write-Host "[Alive    #$($item.ShortId)] still running ($([Math]::Round($elapsed / 1000.0, 1))s elapsed)..." -ForegroundColor DarkGray
+                    }
+                }
+            }
+
+            $delayTask = [Threading.Tasks.Task]::Delay(800)
+            $doneTask = [Threading.Tasks.Task]::WhenAny($recvTask, $delayTask).GetAwaiter().GetResult()
+            if ($doneTask -ne $recvTask) {
+                continue
+            }
+
+            $res = $recvTask.GetAwaiter().GetResult()
+            if ($res.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
+                throw "WebSocket closed by server"
+            }
+            $recvMs.Write($recvBuf, 0, $res.Count)
+            if (-not $res.EndOfMessage) {
+                $recvSeg = New-Object System.ArraySegment[byte](,$recvBuf)
+                $recvTask = $ws.ReceiveAsync($recvSeg, [Threading.CancellationToken]::None)
+                continue
+            }
+
+            $raw = [Text.Encoding]::UTF8.GetString($recvMs.ToArray())
+            $recvMs.SetLength(0)
+            $recvSeg = New-Object System.ArraySegment[byte](,$recvBuf)
+            $recvTask = $ws.ReceiveAsync($recvSeg, [Threading.CancellationToken]::None)
+
             $envMsg = $raw | ConvertFrom-Json
             $p = $envMsg.payload
 
@@ -161,16 +231,33 @@ while ($true) {
                 "node.ping" {
                     Send-WsJson $ws @{ type = "node.pong"; payload = @{} }
                 }
+                "rpc.task_kill" {
+                    $killId = [string]$p.requestId
+                    if ($activeJobs.ContainsKey($killId)) {
+                        $item = $activeJobs[$killId]
+                        Write-Host "[Killed   #$($item.ShortId)] Stopping job by server request..." -ForegroundColor Yellow
+                        Stop-Job -Job $item.Job -ErrorAction SilentlyContinue
+                        Remove-Job -Job $item.Job -Force -ErrorAction SilentlyContinue
+                        $activeJobs.Remove($killId)
+                        Send-WsJson $ws @{
+                            type = "rpc.exec_result"
+                            payload = @{ requestId = $killId; exitCode = 137; stdout = ""; stderr = "Terminated by mesh_kill_task"; approved = $true; durationMs = [int]$item.Sw.ElapsedMilliseconds }
+                        }
+                    }
+                }
                 "rpc.exec" {
-                    $reqId = $p.requestId
-                    $cmd = $p.command
-                    $execCwd = if ($p.cwd) { $p.cwd } else { $Cwd }
+                    $reqId = [string]$p.requestId
+                    $shortId = if ($reqId.Length -ge 8) { $reqId.Substring(0, 8) } else { $reqId }
+                    $cmd = [string]$p.command
+                    $execCwd = if ($p.cwd) { [string]$p.cwd } else { $Cwd }
                     $elevated = [bool]$p.elevated
+
+                    Write-Host "`n[Received #$shortId] $cmd (cwd: $execCwd)" -ForegroundColor Cyan
 
                     $approved = $true
                     if ($elevated -and $ApprovalMode -eq "askForElevated") {
                         Send-WsJson $ws @{ type = "rpc.awaiting_approval"; payload = @{ requestId = $reqId } }
-                        Write-Host "`n⚡ [APPROVAL REQUIRED] Command: $cmd (in $execCwd)" -ForegroundColor Yellow
+                        Write-Host "⚡ [APPROVAL REQUIRED] Command: $cmd (in $execCwd)" -ForegroundColor Yellow
                         $ans = Read-Host "Approve? [y = yes / n = deny / a = switch to Full Auto]"
                         if ($ans -eq "a") {
                             $ApprovalMode = "fullAuto"
@@ -187,28 +274,40 @@ while ($true) {
                         }
                     } else {
                         $sw = [Diagnostics.Stopwatch]::StartNew()
-                        $psi = New-Object Diagnostics.ProcessStartInfo
-                        $psi.FileName = "powershell.exe"
-                        $psi.Arguments = "-NoProfile -NonInteractive -Command `"$($cmd.Replace('"', '\"'))`""
-                        if (Test-Path $execCwd) { $psi.WorkingDirectory = $execCwd }
-                        $psi.RedirectStandardOutput = $true
-                        $psi.RedirectStandardError = $true
-                        $psi.UseShellExecute = $false
-                        $proc = [Diagnostics.Process]::Start($psi)
-                        $stdout = $proc.StandardOutput.ReadToEnd()
-                        $stderr = $proc.StandardError.ReadToEnd()
-                        $proc.WaitForExit()
-                        $sw.Stop()
-                        Send-WsJson $ws @{
-                            type = "rpc.exec_result"
-                            payload = @{
-                                requestId = $reqId
-                                exitCode = $proc.ExitCode
-                                stdout = $stdout
-                                stderr = $stderr
-                                approved = $true
-                                durationMs = [int]$sw.ElapsedMilliseconds
+                        $job = Start-Job -ArgumentList $cmd, $execCwd -ScriptBlock {
+                            param($commandText, $workingDir)
+                            if ($workingDir -and (Test-Path -LiteralPath $workingDir)) {
+                                Set-Location -LiteralPath $workingDir
                             }
+                            $global:LASTEXITCODE = 0
+                            $outputLines = Invoke-Expression $commandText 2>&1
+                            $stdOutList = New-Object System.Collections.Generic.List[string]
+                            $stdErrList = New-Object System.Collections.Generic.List[string]
+                            foreach ($item in $outputLines) {
+                                if ($item -is [System.Management.Automation.ErrorRecord]) {
+                                    $stdErrList.Add($item.ToString())
+                                } elseif ($null -ne $item) {
+                                    $stdOutList.Add($item.ToString())
+                                }
+                            }
+                            $code = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+                            return @{
+                                exitCode = $code
+                                stdout = ($stdOutList -join "`n")
+                                stderr = ($stdErrList -join "`n")
+                            }
+                        }
+                        Write-Host "[Running  #$shortId] Background job #$($job.Id) started..." -ForegroundColor Green
+                        $activeJobs[$reqId] = @{
+                            Job = $job
+                            Sw = $sw
+                            LastHbMs = 0
+                            LastLogMs = 0
+                            ShortId = $shortId
+                        }
+                        Send-WsJson $ws @{
+                            type = "rpc.exec_heartbeat"
+                            payload = @{ requestId = $reqId; pid = $job.Id; alive = $true; elapsedMs = 0 }
                         }
                     }
                 }

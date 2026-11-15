@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:mesh_protocol/mesh_protocol.dart';
@@ -31,25 +32,34 @@ class ConnectedPeer {
   }
 }
 
+class CommandWaitOutcome {
+  final bool completed;
+  final ExecResult? result;
+  final RemoteTaskInfo taskInfo;
+
+  const CommandWaitOutcome({
+    required this.completed,
+    this.result,
+    required this.taskInfo,
+  });
+}
+
 class _PendingRpc<T> {
   final String requestId;
   final String nodeId;
   final Completer<T> completer;
   Timer? timer;
-  final void Function(T timeoutValue) onTimeoutBuilder;
 
   _PendingRpc({
     required this.requestId,
     required this.nodeId,
     required this.completer,
-    required this.onTimeoutBuilder,
   });
 
   void armTimeout(Duration duration) {
     timer?.cancel();
     timer = Timer(duration, () {
       if (!completer.isCompleted) {
-        onTimeoutBuilder;
         completer.completeError(
           TimeoutException('RPC $requestId timed out on node $nodeId', duration),
         );
@@ -63,24 +73,67 @@ class _PendingRpc<T> {
   }
 }
 
+class _ManagedRemoteTask {
+  RemoteTaskInfo info;
+  final DateTime startedClock;
+  DateTime lastHeartbeatClock;
+  final String? requestingSessionId;
+  bool wasDetachedToBackground = false;
+  bool wasConsumedByWaitForTask = false;
+  final Completer<ExecResult> completer = Completer<ExecResult>();
+  ExecResult? finalResult;
+  Timer? livenessWatchdog;
+  Process? localProcess;
+
+  _ManagedRemoteTask({
+    required this.info,
+    required this.startedClock,
+    this.requestingSessionId,
+  }) : lastHeartbeatClock = startedClock;
+
+  void cancelWatchdog() {
+    livenessWatchdog?.cancel();
+    livenessWatchdog = null;
+  }
+
+  RemoteTaskInfo refreshedSnapshot() {
+    if (!info.isActive) return info;
+    final now = DateTime.now().toUtc();
+    final elapsed = now.difference(startedClock).inMilliseconds;
+    return info.copyWith(
+      elapsedMs: elapsed > info.elapsedMs ? elapsed : info.elapsedMs,
+    );
+  }
+}
+
 class NodeRegistry {
   final PairingAndSessionStore store;
   final bool exposeLocalServerNode;
+  final Duration heartbeatPingInterval;
+  final Duration heartbeatLivenessTimeout;
   final _uuid = const Uuid();
 
   final Map<String, ConnectedPeer> _peersByConnId = {};
   final Map<String, ConnectedPeer> _activeNodePeers = {};
-  final Map<String, _PendingRpc<ExecResult>> _pendingExecs = {};
+  final Map<String, _ManagedRemoteTask> _tasks = {};
   final Map<String, _PendingRpc<FileOpResult>> _pendingFileOps = {};
 
   void Function(String nodeId, String requestId)? onNodeAwaitingApproval;
+  void Function(
+    String sessionId,
+    RemoteTaskInfo taskInfo,
+    ExecResult result,
+  )? onDetachedTaskCompleted;
   Timer? _heartbeatTimer;
+  DateTime _lastTasksBroadcast = DateTime.fromMillisecondsSinceEpoch(0);
 
   NodeRegistry({
     required this.store,
     this.exposeLocalServerNode = false,
+    this.heartbeatPingInterval = const Duration(seconds: 10),
+    this.heartbeatLivenessTimeout = const Duration(seconds: 45),
   }) {
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+    _heartbeatTimer = Timer.periodic(heartbeatPingInterval, (_) {
       _pingAll();
     });
   }
@@ -120,6 +173,29 @@ class NodeRegistry {
 
   void registerPeer(ConnectedPeer peer) {
     _peersByConnId[peer.connectionId] = peer;
+  }
+
+  /// Called on ANY incoming WebSocket frame (including `node.pong` and `rpc.exec_heartbeat`)
+  /// from `peer` so active tasks on that computer know the link is alive.
+  void touchPeerHeartbeat(ConnectedPeer peer) {
+    final now = DateTime.now().toUtc();
+    peer.lastSeen = now;
+    final info = peer.nodeInfo;
+    if (info == null) return;
+    peer.nodeInfo = info.copyWith(lastSeenAt: now.toIso8601String(), online: true);
+
+    for (final task in _tasks.values) {
+      if (task.info.nodeId == info.nodeId && task.info.isActive) {
+        task.lastHeartbeatClock = now;
+        task.info = task.info.copyWith(
+          lastHeartbeatAt: now.toIso8601String(),
+          heartbeatHealthy: true,
+        );
+        if (task.info.status == 'running') {
+          _armTaskWatchdog(task, heartbeatLivenessTimeout);
+        }
+      }
+    }
   }
 
   void bindAuthenticatedNode(ConnectedPeer peer, NodeInfo info) {
@@ -166,29 +242,29 @@ class NodeRegistry {
       final currentActive = _activeNodePeers[info.nodeId];
       if (currentActive?.connectionId == peer.connectionId) {
         _activeNodePeers.remove(info.nodeId);
+        final nowIso = DateTime.now().toUtc().toIso8601String();
         final offlineInfo = info.copyWith(
           online: false,
-          lastSeenAt: DateTime.now().toUtc().toIso8601String(),
+          lastSeenAt: nowIso,
         );
         store.updateNodeMetadata(offlineInfo);
 
-        // Fail any pending RPCs for this disconnected node immediately
-        final failedExecIds = _pendingExecs.entries
-            .where((e) => e.value.nodeId == info.nodeId)
-            .map((e) => e.key)
-            .toList();
-        for (final id in failedExecIds) {
-          final rpc = _pendingExecs.remove(id);
-          rpc?.cancelTimer();
-          if (rpc != null && !rpc.completer.isCompleted) {
-            rpc.completer.complete(
+        // Fail any active tasks on this disconnected node immediately
+        for (final task in _tasks.values) {
+          if (task.info.nodeId == info.nodeId && task.info.isActive) {
+            _finalizeTask(
+              task,
               ExecResult(
-                requestId: id,
+                requestId: task.info.taskId,
                 exitCode: -1,
-                stdout: '',
-                stderr: 'Node "${info.hostname}" disconnected during execution.',
+                stdout: task.info.stdoutTail,
+                stderr:
+                    '${task.info.stderrTail}\nNode "${info.hostname}" disconnected during execution.'
+                        .trim(),
                 errorMessage: 'Node disconnected',
+                durationMs: task.refreshedSnapshot().elapsedMs,
               ),
+              overrideStatus: 'lost_heartbeat',
             );
           }
         }
@@ -211,6 +287,7 @@ class NodeRegistry {
           }
         }
         broadcastFleetSnapshot();
+        broadcastTasksSnapshot(force: true);
       }
     }
   }
@@ -236,7 +313,6 @@ class NodeRegistry {
     return list;
   }
 
-  /// Resolves a node by exact `nodeId`, exact `hostname`, or unique prefix/substring.
   NodeInfo? resolveNode(String nodeRef) {
     final query = nodeRef.trim();
     if (query.isEmpty) return null;
@@ -280,25 +356,80 @@ class NodeRegistry {
       WsEnvelope(
         type: WsTypes.sessionsSnapshot,
         payload: {
-          'sessions': store.listSessions().map((s) => s.toSummaryJson()).toList(),
+          'sessions':
+              store.listSessions().map((s) => s.toSummaryJson()).toList(),
         },
       ),
     );
   }
 
-  // ---------------- Remote Execution & File Ops ----------------
+  void broadcastTasksSnapshot({bool force = false}) {
+    final now = DateTime.now().toUtc();
+    if (!force &&
+        now.difference(_lastTasksBroadcast) < const Duration(seconds: 2)) {
+      return;
+    }
+    _lastTasksBroadcast = now;
+    broadcastToAuthenticated(
+      WsEnvelope(
+        type: WsTypes.tasksSnapshot,
+        payload: {
+          'tasks': listTasks(includeCompleted: true)
+              .take(25)
+              .map((t) => t.toJson())
+              .toList(),
+        },
+      ),
+    );
+  }
 
-  Future<ExecResult> executeCommand({
+  // ---------------- Heartbeat-Backed Remote Execution & Task Inspection ----------------
+
+  List<RemoteTaskInfo> listTasks({
+    String? nodeRef,
+    bool includeCompleted = true,
+  }) {
+    String? filterNodeId;
+    if (nodeRef != null && nodeRef.trim().isNotEmpty) {
+      filterNodeId = resolveNode(nodeRef)?.nodeId ?? nodeRef.trim();
+    }
+    final items = _tasks.values
+        .map((t) => t.refreshedSnapshot())
+        .where((info) =>
+            (includeCompleted || info.isActive) &&
+            (filterNodeId == null || info.nodeId == filterNodeId))
+        .toList();
+    items.sort((a, b) {
+      if (a.isActive != b.isActive) return a.isActive ? -1 : 1;
+      return b.startedAt.compareTo(a.startedAt);
+    });
+    return items;
+  }
+
+  RemoteTaskInfo? getTaskInfo(String taskId) =>
+      _tasks[taskId.trim()]?.refreshedSnapshot();
+
+  ExecResult? getCompletedTaskResult(String taskId) =>
+      _tasks[taskId.trim()]?.finalResult;
+
+  /// Starts a remote command backed by continuous client heartbeats and waits up to
+  /// `waitSec` for completion. If the command is still running after `waitSec` and
+  /// heartbeats are healthy, the process is NOT killed—`completed: false` is returned
+  /// with the live `RemoteTaskInfo` (`taskId`, `pid`, `stdoutTail`, `lastHeartbeatAt`)
+  /// so the caller can keep waiting via `waitForTask`.
+  Future<CommandWaitOutcome> startOrWaitCommand({
     required String nodeRef,
     required String command,
     String? cwd,
     bool elevated = false,
-    int timeoutSec = 120,
+    int waitSec = 90,
+    int hardTimeoutSec = 0,
+    String? requestingSessionId,
     String? requestingSessionTitle,
   }) async {
     final resolved = resolveNode(nodeRef);
     if (resolved == null) {
-      return ExecResult(
+      final err = ExecResult(
         requestId: 'none',
         exitCode: -1,
         stdout: '',
@@ -306,46 +437,121 @@ class NodeRegistry {
             'Unknown target node "$nodeRef". Call mesh_list_nodes to see valid node IDs/hostnames.',
         errorMessage: 'Unknown node',
       );
+      final nowIso = DateTime.now().toUtc().toIso8601String();
+      return CommandWaitOutcome(
+        completed: true,
+        result: err,
+        taskInfo: RemoteTaskInfo(
+          taskId: 'none',
+          nodeId: nodeRef,
+          nodeHostname: nodeRef,
+          command: command,
+          status: 'failed',
+          startedAt: nowIso,
+          lastHeartbeatAt: nowIso,
+          heartbeatHealthy: false,
+        ),
+      );
     }
 
+    final now = DateTime.now().toUtc();
+    final nowIso = now.toIso8601String();
+    final requestId = _uuid.v4();
+
     if (resolved.nodeId == localServerNodeId && exposeLocalServerNode) {
-      return _executeLocalCommand(
+      final task = _ManagedRemoteTask(
+        startedClock: now,
+        requestingSessionId: requestingSessionId,
+        info: RemoteTaskInfo(
+          taskId: requestId,
+          nodeId: resolved.nodeId,
+          nodeHostname: resolved.hostname,
+          command: command,
+          cwd: cwd ?? resolved.cwd,
+          elevated: elevated,
+          sessionTitle: requestingSessionTitle ?? '',
+          status: 'running',
+          startedAt: nowIso,
+          lastHeartbeatAt: nowIso,
+          heartbeatHealthy: true,
+        ),
+      );
+      _tasks[requestId] = task;
+      _pruneOldCompletedTasks();
+      broadcastTasksSnapshot(force: true);
+      unawaited(_runLocalManagedCommand(
+        task: task,
         command: command,
         cwd: cwd,
-        timeoutSec: timeoutSec,
-      );
+        hardTimeoutSec: hardTimeoutSec,
+      ));
+      final outcome = (await waitForTask(
+        requestId,
+        waitSec: waitSec,
+        isInitialLaunch: true,
+      ))!;
+      if (!outcome.completed) {
+        task.wasDetachedToBackground = true;
+      }
+      return outcome;
     }
 
     final peer = _activeNodePeers[resolved.nodeId];
     if (peer == null || !resolved.online) {
-      return ExecResult(
+      final err = ExecResult(
         requestId: 'none',
         exitCode: -1,
         stdout: '',
-        stderr: 'Target node "${resolved.hostname}" (${resolved.nodeId}) is currently offline.',
+        stderr:
+            'Target node "${resolved.hostname}" (${resolved.nodeId}) is currently offline.',
         errorMessage: 'Node offline',
+      );
+      return CommandWaitOutcome(
+        completed: true,
+        result: err,
+        taskInfo: RemoteTaskInfo(
+          taskId: 'none',
+          nodeId: resolved.nodeId,
+          nodeHostname: resolved.hostname,
+          command: command,
+          status: 'failed',
+          startedAt: nowIso,
+          lastHeartbeatAt: nowIso,
+          heartbeatHealthy: false,
+        ),
       );
     }
 
-    final requestId = _uuid.v4();
     final req = ExecRequest(
       requestId: requestId,
       command: command,
       cwd: cwd,
       elevated: elevated,
-      timeoutSec: timeoutSec,
+      timeoutSec: hardTimeoutSec, // 0 = no arbitrary wall-clock kill!
       requestingSessionTitle: requestingSessionTitle,
     );
 
-    final completer = Completer<ExecResult>();
-    final pending = _PendingRpc<ExecResult>(
-      requestId: requestId,
-      nodeId: resolved.nodeId,
-      completer: completer,
-      onTimeoutBuilder: (_) {},
+    final managed = _ManagedRemoteTask(
+      startedClock: now,
+      requestingSessionId: requestingSessionId,
+      info: RemoteTaskInfo(
+        taskId: requestId,
+        nodeId: resolved.nodeId,
+        nodeHostname: resolved.hostname,
+        command: command,
+        cwd: cwd ?? resolved.cwd,
+        elevated: elevated,
+        sessionTitle: requestingSessionTitle ?? '',
+        status: 'running',
+        startedAt: nowIso,
+        lastHeartbeatAt: nowIso,
+        heartbeatHealthy: true,
+      ),
     );
-    _pendingExecs[requestId] = pending;
-    pending.armTimeout(Duration(seconds: timeoutSec + 15));
+    _tasks[requestId] = managed;
+    _pruneOldCompletedTasks();
+    _armTaskWatchdog(managed, heartbeatLivenessTimeout);
+    broadcastTasksSnapshot(force: true);
 
     peer.send(WsEnvelope(
       type: WsTypes.rpcExec,
@@ -353,39 +559,389 @@ class NodeRegistry {
       payload: req.toJson(),
     ));
 
-    try {
-      return await completer.future;
-    } on TimeoutException {
-      _pendingExecs.remove(requestId);
-      return ExecResult(
-        requestId: requestId,
-        exitCode: 124,
-        stdout: '',
-        stderr: 'Command timed out after ${timeoutSec}s on "${resolved.hostname}".',
-        errorMessage: 'Timeout',
+    final outcome = (await waitForTask(
+      requestId,
+      waitSec: waitSec,
+      isInitialLaunch: true,
+    ))!;
+    if (!outcome.completed) {
+      managed.wasDetachedToBackground = true;
+    }
+    return outcome;
+  }
+
+  /// Waits up to `waitSec` for an existing task to finish, or returns its live
+  /// heartbeat & output status immediately if `waitSec <= 0` or if still running
+  /// after `waitSec`. Returns `null` if `taskId` is unknown.
+  Future<CommandWaitOutcome?> waitForTask(
+    String taskId, {
+    int waitSec = 90,
+    bool isInitialLaunch = false,
+  }) async {
+    final managed = _tasks[taskId.trim()];
+    if (managed == null) return null;
+
+    if (managed.finalResult != null || managed.completer.isCompleted) {
+      if (!isInitialLaunch) {
+        managed.wasConsumedByWaitForTask = true;
+      }
+      final res = managed.finalResult ?? await managed.completer.future;
+      return CommandWaitOutcome(
+        completed: true,
+        result: res,
+        taskInfo: managed.refreshedSnapshot(),
       );
     }
+
+    if (waitSec <= 0) {
+      return CommandWaitOutcome(
+        completed: false,
+        taskInfo: managed.refreshedSnapshot(),
+      );
+    }
+
+    // Also proactively ping the target peer so even legacy/busy clients confirm liveness
+    final peer = _activeNodePeers[managed.info.nodeId];
+    peer?.send(const WsEnvelope(type: WsTypes.nodePing));
+
+    await Future.any<Object?>([
+      managed.completer.future,
+      Future<void>.delayed(Duration(seconds: waitSec)),
+    ]);
+
+    if (managed.finalResult != null || managed.completer.isCompleted) {
+      if (!isInitialLaunch) {
+        managed.wasConsumedByWaitForTask = true;
+      }
+      final res = managed.finalResult ?? await managed.completer.future;
+      return CommandWaitOutcome(
+        completed: true,
+        result: res,
+        taskInfo: managed.refreshedSnapshot(),
+      );
+    }
+
+    return CommandWaitOutcome(
+      completed: false,
+      taskInfo: managed.refreshedSnapshot(),
+    );
+  }
+
+  /// Convenience wrapper awaiting completion (with optional hard timeout).
+  Future<ExecResult> executeCommand({
+    required String nodeRef,
+    required String command,
+    String? cwd,
+    bool elevated = false,
+    int timeoutSec = 0,
+    String? requestingSessionTitle,
+  }) async {
+    final outcome = await startOrWaitCommand(
+      nodeRef: nodeRef,
+      command: command,
+      cwd: cwd,
+      elevated: elevated,
+      waitSec: timeoutSec > 0 ? timeoutSec + 15 : 86400,
+      hardTimeoutSec: timeoutSec,
+      requestingSessionTitle: requestingSessionTitle,
+    );
+    if (outcome.completed && outcome.result != null) {
+      return outcome.result!;
+    }
+    return ExecResult(
+      requestId: outcome.taskInfo.taskId,
+      exitCode: 124,
+      stdout: outcome.taskInfo.stdoutTail,
+      stderr:
+          'Command exceeded wait window on "${outcome.taskInfo.nodeHostname}".',
+      errorMessage: 'Timeout',
+      durationMs: outcome.taskInfo.elapsedMs,
+    );
+  }
+
+  bool killTask(String taskId) {
+    final managed = _tasks[taskId.trim()];
+    if (managed == null || !managed.info.isActive) return false;
+
+    if (managed.localProcess != null) {
+      try {
+        managed.localProcess!.kill(ProcessSignal.sigterm);
+      } catch (_) {}
+    } else {
+      final peer = _activeNodePeers[managed.info.nodeId];
+      peer?.send(WsEnvelope(
+        type: WsTypes.rpcTaskKill,
+        id: managed.info.taskId,
+        payload: {'requestId': managed.info.taskId},
+      ));
+    }
+
+    // If the client doesn't send rpc.exec_result within 5s of kill, finalize locally
+    Timer(const Duration(seconds: 5), () {
+      if (managed.info.isActive) {
+        _finalizeTask(
+          managed,
+          ExecResult(
+            requestId: managed.info.taskId,
+            exitCode: 137,
+            stdout: managed.info.stdoutTail,
+            stderr:
+                '${managed.info.stderrTail}\nProcess terminated via mesh_kill_task.'
+                    .trim(),
+            errorMessage: 'Killed',
+            durationMs: managed.refreshedSnapshot().elapsedMs,
+          ),
+          overrideStatus: 'killed',
+        );
+      }
+    });
+    return true;
+  }
+
+  void _armTaskWatchdog(_ManagedRemoteTask task, Duration window) {
+    task.cancelWatchdog();
+    task.livenessWatchdog = Timer(window, () {
+      if (!task.info.isActive) return;
+      _finalizeTask(
+        task,
+        ExecResult(
+          requestId: task.info.taskId,
+          exitCode: 125,
+          stdout: task.info.stdoutTail,
+          stderr:
+              '${task.info.stderrTail}\nLost heartbeat from "${task.info.nodeHostname}" for ${window.inSeconds}s while waiting for command.'
+                  .trim(),
+          errorMessage: 'Heartbeat lost',
+          durationMs: task.refreshedSnapshot().elapsedMs,
+        ),
+        overrideStatus: 'lost_heartbeat',
+      );
+    });
+  }
+
+  void handleExecHeartbeat(Map<String, dynamic> payload) {
+    final hb = ExecHeartbeat.fromJson(payload);
+    final task = _tasks[hb.requestId];
+    if (task == null || !task.info.isActive) return;
+
+    final now = DateTime.now().toUtc();
+    task.lastHeartbeatClock = now;
+    task.info = task.info.copyWith(
+      status: 'running',
+      pid: hb.pid ?? task.info.pid,
+      lastHeartbeatAt: now.toIso8601String(),
+      elapsedMs: hb.elapsedMs > 0
+          ? hb.elapsedMs
+          : now.difference(task.startedClock).inMilliseconds,
+      stdoutTail: hb.stdoutTail.isNotEmpty ? hb.stdoutTail : task.info.stdoutTail,
+      stderrTail: hb.stderrTail.isNotEmpty ? hb.stderrTail : task.info.stderrTail,
+      heartbeatHealthy: hb.alive,
+    );
+    _armTaskWatchdog(task, heartbeatLivenessTimeout);
+    broadcastTasksSnapshot(force: false);
   }
 
   void handleExecAwaitingApproval(String nodeId, String requestId) {
-    final pending = _pendingExecs[requestId];
-    if (pending != null) {
-      // Give the human up to 10 minutes to click Approve/Deny on the target device
-      pending.armTimeout(const Duration(minutes: 10));
+    final task = _tasks[requestId];
+    if (task != null && task.info.isActive) {
+      final nowIso = DateTime.now().toUtc().toIso8601String();
+      task.info = task.info.copyWith(
+        status: 'awaiting_approval',
+        lastHeartbeatAt: nowIso,
+        heartbeatHealthy: true,
+      );
+      // Allow up to 10 minutes for human approval on the target device
+      _armTaskWatchdog(task, const Duration(minutes: 10));
       onNodeAwaitingApproval?.call(nodeId, requestId);
+      broadcastTasksSnapshot(force: true);
     }
   }
 
   void handleExecResult(Map<String, dynamic> payload) {
     final res = ExecResult.fromJson(payload);
-    final pending = _pendingExecs.remove(res.requestId);
-    if (pending != null) {
-      pending.cancelTimer();
-      if (!pending.completer.isCompleted) {
-        pending.completer.complete(res);
-      }
+    final task = _tasks[res.requestId];
+    if (task != null) {
+      _finalizeTask(task, res);
     }
   }
+
+  void _finalizeTask(
+    _ManagedRemoteTask task,
+    ExecResult res, {
+    String? overrideStatus,
+  }) {
+    task.cancelWatchdog();
+    final nowIso = DateTime.now().toUtc().toIso8601String();
+    final tailOut = res.stdout.length > 2000
+        ? res.stdout.substring(res.stdout.length - 2000)
+        : res.stdout;
+    final tailErr = res.stderr.length > 1000
+        ? res.stderr.substring(res.stderr.length - 1000)
+        : res.stderr;
+
+    final nextStatus = overrideStatus ??
+        ((res.exitCode == 0 && res.approved && res.errorMessage == null)
+            ? 'completed'
+            : (res.exitCode == 137 ? 'killed' : 'failed'));
+
+    task.finalResult = res;
+    task.info = task.info.copyWith(
+      status: nextStatus,
+      lastHeartbeatAt: nowIso,
+      completedAt: nowIso,
+      elapsedMs: res.durationMs > 0
+          ? res.durationMs
+          : task.refreshedSnapshot().elapsedMs,
+      exitCode: res.exitCode,
+      stdoutTail: tailOut,
+      stderrTail: tailErr,
+      heartbeatHealthy: nextStatus == 'completed',
+    );
+    if (!task.completer.isCompleted) {
+      task.completer.complete(res);
+    }
+    broadcastTasksSnapshot(force: true);
+
+    // Event-driven async server wakeup: if this task detached into background for a
+    // session and was not already consumed synchronously via waitForTask, trigger
+    // the Brain callback once the event loop settles.
+    final sessId = task.requestingSessionId;
+    if (sessId != null &&
+        sessId.isNotEmpty &&
+        onDetachedTaskCompleted != null) {
+      Timer(const Duration(milliseconds: 350), () {
+        if (task.wasDetachedToBackground && !task.wasConsumedByWaitForTask) {
+          onDetachedTaskCompleted?.call(sessId, task.info, res);
+        }
+      });
+    }
+  }
+
+  void _pruneOldCompletedTasks() {
+    final completedEntries = _tasks.entries
+        .where((e) => !e.value.info.isActive)
+        .toList()
+      ..sort((a, b) => a.value.info.startedAt.compareTo(b.value.info.startedAt));
+    while (completedEntries.length > 40) {
+      final oldest = completedEntries.removeAt(0);
+      _tasks.remove(oldest.key);
+    }
+  }
+
+  Future<void> _runLocalManagedCommand({
+    required _ManagedRemoteTask task,
+    required String command,
+    String? cwd,
+    required int hardTimeoutSec,
+  }) async {
+    final sw = Stopwatch()..start();
+    final outBuf = StringBuffer();
+    final errBuf = StringBuffer();
+    Timer? hbTimer;
+
+    try {
+      final proc = await Process.start(
+        Platform.isWindows ? 'powershell.exe' : 'bash',
+        Platform.isWindows
+            ? ['-NoProfile', '-NonInteractive', '-Command', command]
+            : ['-c', command],
+        workingDirectory: (cwd != null && cwd.isNotEmpty) ? cwd : null,
+      );
+      task.localProcess = proc;
+      task.info = task.info.copyWith(pid: proc.pid);
+
+      final outDone = Completer<void>();
+      final errDone = Completer<void>();
+      proc.stdout.transform(const Utf8Decoder(allowMalformed: true)).listen(
+        (chunk) => outBuf.write(chunk),
+        onDone: () => outDone.complete(),
+        onError: (_) {
+          if (!outDone.isCompleted) outDone.complete();
+        },
+      );
+      proc.stderr.transform(const Utf8Decoder(allowMalformed: true)).listen(
+        (chunk) => errBuf.write(chunk),
+        onDone: () => errDone.complete(),
+        onError: (_) {
+          if (!errDone.isCompleted) errDone.complete();
+        },
+      );
+
+      hbTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+        final sOut = outBuf.toString();
+        final sErr = errBuf.toString();
+        task.info = task.info.copyWith(
+          lastHeartbeatAt: DateTime.now().toUtc().toIso8601String(),
+          elapsedMs: sw.elapsedMilliseconds,
+          stdoutTail:
+              sOut.length > 2000 ? sOut.substring(sOut.length - 2000) : sOut,
+          stderrTail:
+              sErr.length > 1000 ? sErr.substring(sErr.length - 1000) : sErr,
+          heartbeatHealthy: true,
+        );
+        broadcastTasksSnapshot(force: false);
+      });
+
+      int exitCode;
+      if (hardTimeoutSec > 0) {
+        exitCode = await proc.exitCode.timeout(
+          Duration(seconds: hardTimeoutSec),
+          onTimeout: () {
+            proc.kill(ProcessSignal.sigterm);
+            throw TimeoutException('Hard timeout reached');
+          },
+        );
+      } else {
+        exitCode = await proc.exitCode;
+      }
+      await Future.wait([outDone.future, errDone.future]);
+      sw.stop();
+      hbTimer.cancel();
+
+      _finalizeTask(
+        task,
+        ExecResult(
+          requestId: task.info.taskId,
+          exitCode: exitCode,
+          stdout: outBuf.toString(),
+          stderr: errBuf.toString(),
+          durationMs: sw.elapsedMilliseconds,
+        ),
+      );
+    } on TimeoutException {
+      sw.stop();
+      hbTimer?.cancel();
+      _finalizeTask(
+        task,
+        ExecResult(
+          requestId: task.info.taskId,
+          exitCode: 124,
+          stdout: outBuf.toString(),
+          stderr:
+              '${errBuf.toString()}\nCommand reached explicit hard_timeout_sec (${hardTimeoutSec}s).'
+                  .trim(),
+          errorMessage: 'Hard timeout',
+          durationMs: sw.elapsedMilliseconds,
+        ),
+      );
+    } catch (e) {
+      sw.stop();
+      hbTimer?.cancel();
+      _finalizeTask(
+        task,
+        ExecResult(
+          requestId: task.info.taskId,
+          exitCode: -1,
+          stdout: outBuf.toString(),
+          stderr: e.toString(),
+          errorMessage: e.toString(),
+          durationMs: sw.elapsedMilliseconds,
+        ),
+      );
+    }
+  }
+
+  // ---------------- Remote File Operations ----------------
 
   Future<FileOpResult> performFileOp({
     required String nodeRef,
@@ -434,7 +990,8 @@ class NodeRegistry {
       return FileOpResult(
         requestId: 'none',
         ok: false,
-        error: 'Target node "${resolved.hostname}" (${resolved.nodeId}) is currently offline.',
+        error:
+            'Target node "${resolved.hostname}" (${resolved.nodeId}) is currently offline.',
       );
     }
 
@@ -456,10 +1013,9 @@ class NodeRegistry {
       requestId: requestId,
       nodeId: resolved.nodeId,
       completer: completer,
-      onTimeoutBuilder: (_) {},
     );
     _pendingFileOps[requestId] = pending;
-    pending.armTimeout(const Duration(seconds: 45));
+    pending.armTimeout(const Duration(seconds: 60));
 
     peer.send(WsEnvelope(
       type: WsTypes.rpcFileOp,
@@ -517,52 +1073,6 @@ class NodeRegistry {
     return ctx.join(base, trimmed);
   }
 
-  Future<ExecResult> _executeLocalCommand({
-    required String command,
-    String? cwd,
-    required int timeoutSec,
-  }) async {
-    final sw = Stopwatch()..start();
-    try {
-      final proc = await Process.start(
-        Platform.isWindows ? 'powershell.exe' : 'bash',
-        Platform.isWindows
-            ? ['-NoProfile', '-NonInteractive', '-Command', command]
-            : ['-c', command],
-        workingDirectory: (cwd != null && cwd.isNotEmpty) ? cwd : null,
-      );
-      final stdoutFuture = proc.stdout.transform(SystemEncoding().decoder).join();
-      final stderrFuture = proc.stderr.transform(SystemEncoding().decoder).join();
-      final exitCode = await proc.exitCode.timeout(Duration(seconds: timeoutSec));
-      sw.stop();
-      return ExecResult(
-        requestId: 'local',
-        exitCode: exitCode,
-        stdout: await stdoutFuture,
-        stderr: await stderrFuture,
-        durationMs: sw.elapsedMilliseconds,
-      );
-    } on TimeoutException {
-      sw.stop();
-      return ExecResult(
-        requestId: 'local',
-        exitCode: 124,
-        stdout: '',
-        stderr: 'Local server command timed out after ${timeoutSec}s',
-        durationMs: sw.elapsedMilliseconds,
-      );
-    } catch (e) {
-      sw.stop();
-      return ExecResult(
-        requestId: 'local',
-        exitCode: -1,
-        stdout: '',
-        stderr: e.toString(),
-        durationMs: sw.elapsedMilliseconds,
-      );
-    }
-  }
-
   Future<FileOpResult> _performLocalFileOp({
     required String op,
     required String path,
@@ -587,8 +1097,8 @@ class NodeRegistry {
           final text = await file.readAsString();
           final lines = text.split('\n');
           final s = (startLine ?? 1).clamp(1, lines.isEmpty ? 1 : lines.length);
-          final e =
-              (endLine ?? lines.length).clamp(s, lines.isEmpty ? 1 : lines.length);
+          final e = (endLine ?? lines.length)
+              .clamp(s, lines.isEmpty ? 1 : lines.length);
           final slice = lines.isEmpty ? '' : lines.sublist(s - 1, e).join('\n');
           return FileOpResult(requestId: 'local', ok: true, content: slice);
         case 'write':
@@ -673,6 +1183,10 @@ class NodeRegistry {
 
   void dispose() {
     _heartbeatTimer?.cancel();
+    for (final task in _tasks.values) {
+      task.cancelWatchdog();
+    }
+    _tasks.clear();
     final peers = _peersByConnId.values.toList();
     _peersByConnId.clear();
     _activeNodePeers.clear();

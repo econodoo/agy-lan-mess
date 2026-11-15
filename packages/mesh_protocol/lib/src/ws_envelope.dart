@@ -31,12 +31,16 @@ class WsTypes {
   static const String brainSetModel = 'brain.set_model';
   static const String brainStatus = 'brain.status';
 
-  // Server -> Target Node RPC
+  // Server -> Target Node RPC & Heartbeat Task Tracking
   static const String rpcExec = 'rpc.exec';
+  static const String rpcExecHeartbeat = 'rpc.exec_heartbeat';
   static const String rpcExecResult = 'rpc.exec_result';
+  static const String rpcTaskKill = 'rpc.task_kill';
   static const String rpcAwaitingApproval = 'rpc.awaiting_approval';
   static const String rpcFileOp = 'rpc.file_op';
   static const String rpcFileOpResult = 'rpc.file_op_result';
+  static const String tasksSnapshot = 'tasks.snapshot';
+  static const String taskKillRequest = 'task.kill';
 }
 
 class WsEnvelope {

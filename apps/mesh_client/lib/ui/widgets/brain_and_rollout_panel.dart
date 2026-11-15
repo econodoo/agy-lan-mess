@@ -403,3 +403,164 @@ class _StatusTile extends StatelessWidget {
     );
   }
 }
+
+class ActiveRemoteTasksCard extends StatelessWidget {
+  final MeshAppController controller;
+
+  const ActiveRemoteTasksCard({super.key, required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final tasks = c.remoteTasks;
+    if (tasks.isEmpty) return const SizedBox.shrink();
+
+    final cs = Theme.of(context).colorScheme;
+    final activeCount = tasks.where((t) => t.isActive).length;
+
+    return Card(
+      elevation: 0,
+      color: cs.surfaceContainerHigh,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  activeCount > 0 ? Icons.monitor_heart : Icons.history,
+                  color: activeCount > 0
+                      ? Colors.greenAccent.shade400
+                      : cs.primary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    activeCount > 0
+                        ? 'Live Remote Processes & Heartbeats ($activeCount Running)'
+                        : 'Recent Remote Processes (${tasks.length})',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            ...tasks.take(8).map((t) {
+              final sec = (t.elapsedMs / 1000.0).toStringAsFixed(1);
+              final hbTime = DateTime.tryParse(t.lastHeartbeatAt);
+              final hbAge = hbTime != null
+                  ? DateTime.now().toUtc().difference(hbTime).inSeconds
+                  : 0;
+              final tail =
+                  (t.stdoutTail.isNotEmpty ? t.stdoutTail : t.stderrTail).trim();
+
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: cs.surface,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: t.isActive
+                        ? Colors.greenAccent.withValues(alpha: 0.5)
+                        : cs.outlineVariant.withValues(alpha: 0.4),
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        if (t.isActive)
+                          const Padding(
+                            padding: EdgeInsets.only(right: 8),
+                            child: SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        else
+                          Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: Icon(
+                              t.exitCode == 0
+                                  ? Icons.check_circle_outline
+                                  : Icons.error_outline,
+                              size: 16,
+                              color: t.exitCode == 0
+                                  ? Colors.greenAccent.shade400
+                                  : Colors.redAccent,
+                            ),
+                          ),
+                        Expanded(
+                          child: Text(
+                            '[${t.nodeHostname}] ${t.command}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontWeight: FontWeight.w700,
+                              fontSize: 12.5,
+                            ),
+                          ),
+                        ),
+                        if (t.isActive)
+                          TextButton.icon(
+                            onPressed: () => c.killRemoteTask(t.taskId),
+                            icon: const Icon(
+                              Icons.stop_circle_outlined,
+                              size: 16,
+                              color: Colors.redAccent,
+                            ),
+                            label: const Text(
+                              'Kill',
+                              style: TextStyle(color: Colors.redAccent),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      t.isActive
+                          ? 'Status: ${t.status.toUpperCase()}  •  PID: ${t.pid ?? "..."}  •  Elapsed: ${sec}s  •  Heartbeat: ${t.heartbeatHealthy ? "HEALTHY (${hbAge}s ago)" : "STALE"}'
+                          : 'Status: ${t.status.toUpperCase()}  •  Exit: ${t.exitCode ?? "-"}  •  Duration: ${sec}s',
+                      style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
+                    ),
+                    if (tail.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0B1220),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          tail.length > 350
+                              ? '...${tail.substring(tail.length - 350)}'
+                              : tail,
+                          maxLines: 4,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 11,
+                            color: Color(0xFF94A3B8),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+}

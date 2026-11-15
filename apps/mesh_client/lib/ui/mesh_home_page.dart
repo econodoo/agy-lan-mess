@@ -301,6 +301,21 @@ class _MeshHomePageState extends State<MeshHomePage> {
                     visualDensity: VisualDensity.compact,
                   ),
                 ],
+                if (c.remoteTasks.any((t) => t.isActive)) ...[
+                  const SizedBox(width: 8),
+                  ActionChip(
+                    avatar: Icon(
+                      Icons.monitor_heart,
+                      size: 15,
+                      color: Colors.greenAccent.shade400,
+                    ),
+                    label: Text(
+                      '${c.remoteTasks.where((t) => t.isActive).length} Cmd Running (HB OK)',
+                    ),
+                    tooltip: 'View live remote processes & heartbeats',
+                    onPressed: () => setState(() => _activeTab = 1),
+                  ),
+                ],
               ],
             ),
             actions: [
@@ -997,6 +1012,10 @@ class _MeshHomePageState extends State<MeshHomePage> {
               ),
             ),
           ),
+          const SizedBox(height: 18),
+        ],
+        if (c.remoteTasks.isNotEmpty) ...[
+          ActiveRemoteTasksCard(controller: c),
           const SizedBox(height: 18),
         ],
         if (c.isConnected) ...[

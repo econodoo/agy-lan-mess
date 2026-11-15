@@ -375,6 +375,8 @@ class ExecRequest {
   final String? cwd;
   final Map<String, String>? env;
   final bool elevated;
+  /// `0` (default) means no arbitrary wall-clock kill—keep running as long as heartbeats remain alive.
+  /// Set `> 0` only when a strict hard wall-clock kill timeout is explicitly desired.
   final int timeoutSec;
   final String? requestingSessionTitle;
 
@@ -384,7 +386,7 @@ class ExecRequest {
     this.cwd,
     this.env,
     this.elevated = false,
-    this.timeoutSec = 120,
+    this.timeoutSec = 0,
     this.requestingSessionTitle,
   });
 
@@ -406,8 +408,166 @@ class ExecRequest {
         env: (json['env'] as Map?)
             ?.map((k, v) => MapEntry(k.toString(), v.toString())),
         elevated: json['elevated'] as bool? ?? false,
-        timeoutSec: (json['timeoutSec'] as num?)?.toInt() ?? 120,
+        timeoutSec: (json['timeoutSec'] as num?)?.toInt() ?? 0,
         requestingSessionTitle: json['requestingSessionTitle'] as String?,
+      );
+}
+
+class ExecHeartbeat {
+  final String requestId;
+  final int? pid;
+  final bool alive;
+  final int elapsedMs;
+  final int stdoutBytes;
+  final int stderrBytes;
+  final String stdoutTail;
+  final String stderrTail;
+
+  const ExecHeartbeat({
+    required this.requestId,
+    this.pid,
+    this.alive = true,
+    this.elapsedMs = 0,
+    this.stdoutBytes = 0,
+    this.stderrBytes = 0,
+    this.stdoutTail = '',
+    this.stderrTail = '',
+  });
+
+  Map<String, dynamic> toJson() => {
+        'requestId': requestId,
+        if (pid != null) 'pid': pid,
+        'alive': alive,
+        'elapsedMs': elapsedMs,
+        'stdoutBytes': stdoutBytes,
+        'stderrBytes': stderrBytes,
+        if (stdoutTail.isNotEmpty) 'stdoutTail': stdoutTail,
+        if (stderrTail.isNotEmpty) 'stderrTail': stderrTail,
+      };
+
+  factory ExecHeartbeat.fromJson(Map<String, dynamic> json) => ExecHeartbeat(
+        requestId: json['requestId'] as String? ?? '',
+        pid: (json['pid'] as num?)?.toInt(),
+        alive: json['alive'] as bool? ?? true,
+        elapsedMs: (json['elapsedMs'] as num?)?.toInt() ?? 0,
+        stdoutBytes: (json['stdoutBytes'] as num?)?.toInt() ?? 0,
+        stderrBytes: (json['stderrBytes'] as num?)?.toInt() ?? 0,
+        stdoutTail: json['stdoutTail'] as String? ?? '',
+        stderrTail: json['stderrTail'] as String? ?? '',
+      );
+}
+
+class RemoteTaskInfo {
+  final String taskId;
+  final String nodeId;
+  final String nodeHostname;
+  final String command;
+  final String cwd;
+  final bool elevated;
+  final String sessionTitle;
+  /// running | awaiting_approval | completed | failed | killed | lost_heartbeat
+  final String status;
+  final int? pid;
+  final String startedAt;
+  final String lastHeartbeatAt;
+  final String? completedAt;
+  final int elapsedMs;
+  final int? exitCode;
+  final String stdoutTail;
+  final String stderrTail;
+  final bool heartbeatHealthy;
+
+  const RemoteTaskInfo({
+    required this.taskId,
+    required this.nodeId,
+    required this.nodeHostname,
+    required this.command,
+    this.cwd = '',
+    this.elevated = false,
+    this.sessionTitle = '',
+    this.status = 'running',
+    this.pid,
+    required this.startedAt,
+    required this.lastHeartbeatAt,
+    this.completedAt,
+    this.elapsedMs = 0,
+    this.exitCode,
+    this.stdoutTail = '',
+    this.stderrTail = '',
+    this.heartbeatHealthy = true,
+  });
+
+  bool get isActive => status == 'running' || status == 'awaiting_approval';
+
+  RemoteTaskInfo copyWith({
+    String? status,
+    int? pid,
+    String? lastHeartbeatAt,
+    String? completedAt,
+    int? elapsedMs,
+    int? exitCode,
+    String? stdoutTail,
+    String? stderrTail,
+    bool? heartbeatHealthy,
+  }) =>
+      RemoteTaskInfo(
+        taskId: taskId,
+        nodeId: nodeId,
+        nodeHostname: nodeHostname,
+        command: command,
+        cwd: cwd,
+        elevated: elevated,
+        sessionTitle: sessionTitle,
+        status: status ?? this.status,
+        pid: pid ?? this.pid,
+        startedAt: startedAt,
+        lastHeartbeatAt: lastHeartbeatAt ?? this.lastHeartbeatAt,
+        completedAt: completedAt ?? this.completedAt,
+        elapsedMs: elapsedMs ?? this.elapsedMs,
+        exitCode: exitCode ?? this.exitCode,
+        stdoutTail: stdoutTail ?? this.stdoutTail,
+        stderrTail: stderrTail ?? this.stderrTail,
+        heartbeatHealthy: heartbeatHealthy ?? this.heartbeatHealthy,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'taskId': taskId,
+        'nodeId': nodeId,
+        'nodeHostname': nodeHostname,
+        'command': command,
+        'cwd': cwd,
+        'elevated': elevated,
+        if (sessionTitle.isNotEmpty) 'sessionTitle': sessionTitle,
+        'status': status,
+        if (pid != null) 'pid': pid,
+        'startedAt': startedAt,
+        'lastHeartbeatAt': lastHeartbeatAt,
+        if (completedAt != null) 'completedAt': completedAt,
+        'elapsedMs': elapsedMs,
+        if (exitCode != null) 'exitCode': exitCode,
+        if (stdoutTail.isNotEmpty) 'stdoutTail': stdoutTail,
+        if (stderrTail.isNotEmpty) 'stderrTail': stderrTail,
+        'heartbeatHealthy': heartbeatHealthy,
+      };
+
+  factory RemoteTaskInfo.fromJson(Map<String, dynamic> json) => RemoteTaskInfo(
+        taskId: json['taskId'] as String? ?? '',
+        nodeId: json['nodeId'] as String? ?? '',
+        nodeHostname: json['nodeHostname'] as String? ?? '',
+        command: json['command'] as String? ?? '',
+        cwd: json['cwd'] as String? ?? '',
+        elevated: json['elevated'] as bool? ?? false,
+        sessionTitle: json['sessionTitle'] as String? ?? '',
+        status: json['status'] as String? ?? 'running',
+        pid: (json['pid'] as num?)?.toInt(),
+        startedAt: json['startedAt'] as String? ?? '',
+        lastHeartbeatAt: json['lastHeartbeatAt'] as String? ?? '',
+        completedAt: json['completedAt'] as String?,
+        elapsedMs: (json['elapsedMs'] as num?)?.toInt() ?? 0,
+        exitCode: (json['exitCode'] as num?)?.toInt(),
+        stdoutTail: json['stdoutTail'] as String? ?? '',
+        stderrTail: json['stderrTail'] as String? ?? '',
+        heartbeatHealthy: json['heartbeatHealthy'] as bool? ?? true,
       );
 }
 

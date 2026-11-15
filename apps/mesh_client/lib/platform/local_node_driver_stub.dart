@@ -44,7 +44,12 @@ class LocalNodeDriver {
 
   Future<bool> relaunchAsWindowsAdmin() async => false;
 
-  Future<ExecResult> executeCommand(ExecRequest req) async {
+  Future<bool> killRunningCommand(String requestId) async => false;
+
+  Future<ExecResult> executeCommand(
+    ExecRequest req, {
+    void Function(ExecHeartbeat hb)? onHeartbeat,
+  }) async {
     return ExecResult(
       requestId: req.requestId,
       exitCode: -1,

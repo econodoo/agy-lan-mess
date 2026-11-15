@@ -58,4 +58,9 @@ Note the **6-Digit Pairing PIN** and LAN URL printed in the banner, or open `htt
 
 # List all paired LAN computers and their privilege/online status
 ./build/agy-mesh-server nodes
+
+# Inspect live running remote processes, heartbeats, PIDs, or kill a task
+./build/agy-mesh-server tasks list
+./build/agy-mesh-server tasks status <taskId> --wait 30
+./build/agy-mesh-server tasks kill <taskId>
 ```

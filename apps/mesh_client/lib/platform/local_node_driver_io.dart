@@ -14,6 +14,7 @@ class DiscoveredHub {
 class LocalNodeDriver {
   /// Kept strictly in local process memory—never persisted or sent over the network.
   String? _sudoPassword;
+  final Map<String, Process> _runningProcesses = {};
 
   bool get isWebConsole => false;
   bool get isDesktopTarget =>
@@ -148,7 +149,32 @@ class LocalNodeDriver {
     }
   }
 
-  Future<ExecResult> executeCommand(ExecRequest req) async {
+  Future<bool> killRunningCommand(String requestId) async {
+    final proc = _runningProcesses[requestId];
+    if (proc == null) return false;
+    try {
+      if (Platform.isWindows) {
+        await Process.run('taskkill', ['/PID', '${proc.pid}', '/T', '/F']);
+      } else {
+        proc.kill(ProcessSignal.sigterm);
+        Timer(const Duration(seconds: 2), () {
+          if (_runningProcesses.containsKey(requestId)) {
+            try {
+              proc.kill(ProcessSignal.sigkill);
+            } catch (_) {}
+          }
+        });
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<ExecResult> executeCommand(
+    ExecRequest req, {
+    void Function(ExecHeartbeat hb)? onHeartbeat,
+  }) async {
     final sw = Stopwatch()..start();
     if (Platform.isAndroid) {
       sw.stop();
@@ -162,12 +188,17 @@ class LocalNodeDriver {
       );
     }
 
+    final outBuf = StringBuffer();
+    final errBuf = StringBuffer();
+    Timer? hbTimer;
+
     try {
       late Process proc;
-      final workingDir =
-          (req.cwd != null && req.cwd!.isNotEmpty && Directory(req.cwd!).existsSync())
-              ? req.cwd
-              : null;
+      final workingDir = (req.cwd != null &&
+              req.cwd!.isNotEmpty &&
+              Directory(req.cwd!).existsSync())
+          ? req.cwd
+          : null;
 
       if (Platform.isWindows) {
         proc = await Process.start(
@@ -207,45 +238,103 @@ class LocalNodeDriver {
         }
       }
 
-      final outFuture = proc.stdout
-          .transform(const Utf8Decoder(allowMalformed: true))
-          .join();
-      final errFuture = proc.stderr
-          .transform(const Utf8Decoder(allowMalformed: true))
-          .join();
+      _runningProcesses[req.requestId] = proc;
 
-      final code = await proc.exitCode.timeout(
-        Duration(seconds: req.timeoutSec),
-        onTimeout: () {
-          proc.kill(ProcessSignal.sigterm);
-          throw TimeoutException('Command timed out');
+      final outDone = Completer<void>();
+      final errDone = Completer<void>();
+      proc.stdout.transform(const Utf8Decoder(allowMalformed: true)).listen(
+        (chunk) => outBuf.write(chunk),
+        onDone: () {
+          if (!outDone.isCompleted) outDone.complete();
+        },
+        onError: (_) {
+          if (!outDone.isCompleted) outDone.complete();
         },
       );
+      proc.stderr.transform(const Utf8Decoder(allowMalformed: true)).listen(
+        (chunk) => errBuf.write(chunk),
+        onDone: () {
+          if (!errDone.isCompleted) errDone.complete();
+        },
+        onError: (_) {
+          if (!errDone.isCompleted) errDone.complete();
+        },
+      );
+
+      void emitHeartbeat() {
+        if (onHeartbeat == null) return;
+        final sOut = outBuf.toString();
+        final sErr = errBuf.toString();
+        onHeartbeat(ExecHeartbeat(
+          requestId: req.requestId,
+          pid: proc.pid,
+          alive: true,
+          elapsedMs: sw.elapsedMilliseconds,
+          stdoutBytes: sOut.length,
+          stderrBytes: sErr.length,
+          stdoutTail:
+              sOut.length > 2000 ? sOut.substring(sOut.length - 2000) : sOut,
+          stderrTail:
+              sErr.length > 1000 ? sErr.substring(sErr.length - 1000) : sErr,
+        ));
+      }
+
+      // Immediately report PID & start heartbeat stream every 5 seconds
+      emitHeartbeat();
+      hbTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+        emitHeartbeat();
+      });
+
+      int code;
+      if (req.timeoutSec > 0) {
+        code = await proc.exitCode.timeout(
+          Duration(seconds: req.timeoutSec),
+          onTimeout: () {
+            unawaited(killRunningCommand(req.requestId));
+            throw TimeoutException('Hard timeout reached');
+          },
+        );
+      } else {
+        // No arbitrary wall-clock kill—wait as long as process runs!
+        code = await proc.exitCode;
+      }
+
+      await Future.wait([outDone.future, errDone.future]);
       sw.stop();
+      hbTimer.cancel();
+      _runningProcesses.remove(req.requestId);
+
       return ExecResult(
         requestId: req.requestId,
         exitCode: code,
-        stdout: await outFuture,
-        stderr: await errFuture,
+        stdout: outBuf.toString(),
+        stderr: errBuf.toString(),
         approved: true,
         durationMs: sw.elapsedMilliseconds,
       );
     } on TimeoutException {
       sw.stop();
+      hbTimer?.cancel();
+      _runningProcesses.remove(req.requestId);
       return ExecResult(
         requestId: req.requestId,
         exitCode: 124,
-        stdout: '',
-        stderr: 'Command timed out after ${req.timeoutSec}s',
+        stdout: outBuf.toString(),
+        stderr:
+            '${errBuf.toString()}\nCommand reached explicit hard timeout (${req.timeoutSec}s)'
+                .trim(),
         approved: true,
         durationMs: sw.elapsedMilliseconds,
+        errorMessage: 'Hard timeout',
       );
     } catch (e) {
       sw.stop();
+      hbTimer?.cancel();
+      _runningProcesses.remove(req.requestId);
       return ExecResult(
         requestId: req.requestId,
         exitCode: -1,
-        stdout: '',
+        stdout: outBuf.toString(),
         stderr: e.toString(),
         approved: true,
         durationMs: sw.elapsedMilliseconds,

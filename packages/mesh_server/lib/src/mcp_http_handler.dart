@@ -25,6 +25,9 @@ class McpHttpHandler {
     'mesh_list_sessions',
     'mesh_upsert_session',
     'mesh_exec',
+    'mesh_task_status',
+    'mesh_list_tasks',
+    'mesh_kill_task',
     'mesh_read_file',
     'mesh_write_file',
     'mesh_edit_file',
@@ -249,56 +252,100 @@ class McpHttpHandler {
                 ? linkedSession!.workspacePath
                 : null);
         final elevated = args['elevated'] as bool? ?? false;
-        final timeoutSec = (args['timeout_sec'] as num?)?.toInt() ?? 120;
+        final background = args['background'] as bool? ?? false;
+        final rawWait = background
+            ? 2
+            : ((args['wait_sec'] as num?)?.toInt() ??
+                (args['timeout_sec'] as num?)?.toInt() ??
+                90);
+        // Keep HTTP call safely below Antigravity's 180s MCP HTTP deadline
+        final waitSec = rawWait.clamp(1, 150);
+        final hardTimeoutSec = (args['hard_timeout_sec'] as num?)?.toInt() ?? 0;
 
         onToolActivity?.call(
           sessionId,
           ToolCallSummary(
             id: callId,
             toolName: 'mesh_exec',
-            summary:
-                '[${elevated ? "ELEVATED " : ""}$nodeRef] $command',
+            summary: '[${elevated ? "ELEVATED " : ""}$nodeRef] $command',
             status: 'running',
           ),
         );
 
-        final res = await registry.executeCommand(
+        final outcome = await registry.startOrWaitCommand(
           nodeRef: nodeRef,
           command: command,
           cwd: cwd,
           elevated: elevated,
-          timeoutSec: timeoutSec,
+          waitSec: waitSec,
+          hardTimeoutSec: hardTimeoutSec,
+          requestingSessionId: linkedSession?.sessionId ?? sessionId,
           requestingSessionTitle: linkedSession?.title,
         );
 
-        final isErr = !res.approved || res.errorMessage != null;
-        final preview = (res.stdout.isNotEmpty ? res.stdout : res.stderr).trim();
-        onToolActivity?.call(
-          sessionId,
-          ToolCallSummary(
-            id: callId,
-            toolName: 'mesh_exec',
-            summary:
-                '[${elevated ? "ELEVATED " : ""}$nodeRef] $command (exit ${res.exitCode})',
-            status: (isErr || res.exitCode != 0) ? 'error' : 'done',
-            outputPreview:
-                preview.length > 300 ? '${preview.substring(0, 300)}...' : preview,
-          ),
+        return _formatOutcomeForMcp(
+          outcome: outcome,
+          sessionId: sessionId,
+          callId: callId,
+          toolName: 'mesh_exec',
+          labelPrefix: '[${elevated ? "ELEVATED " : ""}$nodeRef] $command',
         );
 
-        final summaryBuf = StringBuffer()
-          ..writeln('Exit Code: ${res.exitCode} (${res.durationMs}ms)')
-          ..writeln('Approved: ${res.approved}');
-        if (res.errorMessage != null) {
-          summaryBuf.writeln('Error: ${res.errorMessage}');
+      case 'mesh_task_status':
+        final taskId = (args['task_id'] as String?)?.trim() ?? '';
+        if (taskId.isEmpty) {
+          return _mcpTextContent(
+            'Error: "task_id" is required. Call mesh_list_tasks to see running tasks.',
+            isError: true,
+          );
         }
-        if (res.stdout.isNotEmpty) {
-          summaryBuf.writeln('--- STDOUT ---\n${res.stdout}');
+        final waitSec =
+            ((args['wait_sec'] as num?)?.toInt() ?? 90).clamp(0, 150);
+        final outcome = await registry.waitForTask(taskId, waitSec: waitSec);
+        if (outcome == null) {
+          return _mcpTextContent(
+            'Error: Unknown task_id "$taskId". Call mesh_list_tasks to inspect active and recent tasks.',
+            isError: true,
+          );
         }
-        if (res.stderr.isNotEmpty) {
-          summaryBuf.writeln('--- STDERR ---\n${res.stderr}');
+        return _formatOutcomeForMcp(
+          outcome: outcome,
+          sessionId: sessionId,
+          callId: callId,
+          toolName: 'mesh_task_status',
+          labelPrefix:
+              '[${outcome.taskInfo.nodeHostname}] Task $taskId (${outcome.taskInfo.command})',
+        );
+
+      case 'mesh_list_tasks':
+        final nodeFilter = (args['node'] as String?)?.trim();
+        final includeCompleted = args['include_completed'] as bool? ?? true;
+        final tasks = registry.listTasks(
+          nodeRef: (nodeFilter != null && nodeFilter.isNotEmpty)
+              ? nodeFilter
+              : null,
+          includeCompleted: includeCompleted,
+        );
+        if (tasks.isEmpty) {
+          return _mcpTextContent('No active or recent remote tasks.');
         }
-        return _mcpTextContent(summaryBuf.toString(), isError: isErr);
+        final formatted = const JsonEncoder.withIndent('  ')
+            .convert(tasks.map((t) => t.toJson()).toList());
+        return _mcpTextContent(formatted);
+
+      case 'mesh_kill_task':
+        final taskId = (args['task_id'] as String?)?.trim() ?? '';
+        if (taskId.isEmpty) {
+          return _mcpTextContent('Error: "task_id" is required.', isError: true);
+        }
+        final ok = registry.killTask(taskId);
+        return ok
+            ? _mcpTextContent(
+                'Sent kill signal to remote task "$taskId". Call mesh_task_status to verify termination.',
+              )
+            : _mcpTextContent(
+                'Task "$taskId" is not currently active (already finished or unknown).',
+              );
 
       case 'mesh_read_file':
         final nodeRef = resolveNodeRef();
@@ -516,7 +563,7 @@ class McpHttpHandler {
         {
           'name': 'mesh_exec',
           'description':
-              'Execute a shell command (PowerShell on Windows, bash/sh on Linux) on a target LAN computer. Set elevated=true when root/sudo/Administrator privileges are required.',
+              'Execute a shell command (PowerShell on Windows, bash on Linux/macOS) on a target LAN computer. Commands are monitored via live 5-second client heartbeats and are NOT killed at 180s! If a long task is still running after wait_sec (default 90s, max 150s), mesh_exec returns its live task_id and output tail while the process keeps running—then call mesh_task_status to continue waiting or checking progress.',
           'inputSchema': {
             'type': 'object',
             'properties': {
@@ -538,9 +585,20 @@ class McpHttpHandler {
                 'description':
                     'Set true to run via local sudo on Linux or verify Administrator on Windows.',
               },
-              'timeout_sec': {
+              'wait_sec': {
                 'type': 'integer',
-                'description': 'Timeout in seconds (default 120).',
+                'description':
+                    'Seconds to wait in this MCP call before returning a live running task_id handle (default 90, max 150). Does NOT kill the process when elapsed!',
+              },
+              'background': {
+                'type': 'boolean',
+                'description':
+                    'Set true to launch immediately and return task_id after 2s so you can monitor or run other work.',
+              },
+              'hard_timeout_sec': {
+                'type': 'integer',
+                'description':
+                    'Optional strict wall-clock kill limit in seconds (default 0 = unlimited as long as client heartbeats remain alive).',
               },
               'session_id': {
                 'type': 'string',
@@ -549,6 +607,60 @@ class McpHttpHandler {
               },
             },
             'required': ['node', 'command'],
+          },
+        },
+        {
+          'name': 'mesh_task_status',
+          'description':
+              'Wait on or check the live process status, PID, heartbeat health, and recent stdout/stderr of a long-running remote command started by mesh_exec. Set wait_sec=0 for an instant non-blocking status check, or wait_sec=90 (up to 150) to keep waiting while client heartbeats confirm the process is alive.',
+          'inputSchema': {
+            'type': 'object',
+            'properties': {
+              'task_id': {
+                'type': 'string',
+                'description': 'The taskId returned by mesh_exec or mesh_list_tasks.',
+              },
+              'wait_sec': {
+                'type': 'integer',
+                'description':
+                    'Seconds to wait for completion before returning another live progress snapshot (0 for instant check, default 90, max 150).',
+              },
+              'session_id': {'type': 'string'},
+            },
+            'required': ['task_id'],
+          },
+        },
+        {
+          'name': 'mesh_list_tasks',
+          'description':
+              'List all currently running (and optionally recently completed) remote commands across paired LAN computers, including PID, elapsed time, heartbeat status, and output preview.',
+          'inputSchema': {
+            'type': 'object',
+            'properties': {
+              'node': {
+                'type': 'string',
+                'description': 'Optional nodeId or hostname filter.',
+              },
+              'include_completed': {
+                'type': 'boolean',
+                'description': 'Include recent completed tasks (default true).',
+              },
+            },
+          },
+        },
+        {
+          'name': 'mesh_kill_task',
+          'description':
+              'Terminate a running remote process (and its child process tree) by task_id.',
+          'inputSchema': {
+            'type': 'object',
+            'properties': {
+              'task_id': {
+                'type': 'string',
+                'description': 'The taskId of the running remote command to kill.',
+              },
+            },
+            'required': ['task_id'],
           },
         },
         {
@@ -659,6 +771,88 @@ class McpHttpHandler {
           },
         },
       ];
+
+  Map<String, dynamic> _formatOutcomeForMcp({
+    required CommandWaitOutcome outcome,
+    required String? sessionId,
+    required String callId,
+    required String toolName,
+    required String labelPrefix,
+  }) {
+    final t = outcome.taskInfo;
+    if (outcome.completed && outcome.result != null) {
+      final res = outcome.result!;
+      final isErr = !res.approved || res.errorMessage != null;
+      final preview = (res.stdout.isNotEmpty ? res.stdout : res.stderr).trim();
+      onToolActivity?.call(
+        sessionId,
+        ToolCallSummary(
+          id: callId,
+          toolName: toolName,
+          summary: '$labelPrefix (exit ${res.exitCode})',
+          status: (isErr || res.exitCode != 0) ? 'error' : 'done',
+          outputPreview:
+              preview.length > 300 ? '${preview.substring(0, 300)}...' : preview,
+        ),
+      );
+
+      final summaryBuf = StringBuffer()
+        ..writeln('Task ID: ${t.taskId}')
+        ..writeln('Status: ${t.status.toUpperCase()}')
+        ..writeln('Exit Code: ${res.exitCode} (${res.durationMs}ms)')
+        ..writeln('Approved: ${res.approved}');
+      if (res.errorMessage != null) {
+        summaryBuf.writeln('Error: ${res.errorMessage}');
+      }
+      if (res.stdout.isNotEmpty) {
+        summaryBuf.writeln('--- STDOUT ---\n${res.stdout}');
+      }
+      if (res.stderr.isNotEmpty) {
+        summaryBuf.writeln('--- STDERR ---\n${res.stderr}');
+      }
+      return _mcpTextContent(summaryBuf.toString(), isError: isErr);
+    }
+
+    // Still running & client heartbeat is alive!
+    final now = DateTime.now().toUtc();
+    final hbTime = DateTime.tryParse(t.lastHeartbeatAt);
+    final hbAgeSec = hbTime != null
+        ? (now.difference(hbTime).inMilliseconds / 1000.0).toStringAsFixed(1)
+        : '0.0';
+    final elapsedSec = (t.elapsedMs / 1000.0).toStringAsFixed(1);
+    final preview =
+        (t.stdoutTail.isNotEmpty ? t.stdoutTail : t.stderrTail).trim();
+
+    onToolActivity?.call(
+      sessionId,
+      ToolCallSummary(
+        id: callId,
+        toolName: toolName,
+        summary:
+            '$labelPrefix (running ${elapsedSec}s • PID ${t.pid ?? "?"} • HB OK)',
+        status: 'running',
+        outputPreview:
+            preview.length > 300 ? '${preview.substring(0, 300)}...' : preview,
+      ),
+    );
+
+    final buf = StringBuffer()
+      ..writeln('⏳ Command is STILL RUNNING (${t.status.toUpperCase()})')
+      ..writeln('Task ID        : ${t.taskId}')
+      ..writeln('Target Node    : ${t.nodeHostname} (${t.nodeId})')
+      ..writeln('Process PID    : ${t.pid ?? "starting..."}')
+      ..writeln('Elapsed        : ${elapsedSec}s')
+      ..writeln(
+          'Heartbeat      : ${t.heartbeatHealthy ? "HEALTHY" : "STALE"} (last heartbeat ${hbAgeSec}s ago)')
+      ..writeln('Next Step      : Call mesh_task_status with task_id="${t.taskId}" (and wait_sec=90) to continue waiting while heartbeats remain active, or mesh_kill_task to stop it.');
+    if (t.stdoutTail.isNotEmpty) {
+      buf.writeln('--- RECENT STDOUT TAIL ---\n${t.stdoutTail}');
+    }
+    if (t.stderrTail.isNotEmpty) {
+      buf.writeln('--- RECENT STDERR TAIL ---\n${t.stderrTail}');
+    }
+    return _mcpTextContent(buf.toString(), isError: false);
+  }
 
   static Map<String, dynamic> _mcpTextContent(
     String text, {

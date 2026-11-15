@@ -22,6 +22,7 @@ class AgyBrainBridge {
   /// Concurrent running `agy` processes keyed by `sessionId`.
   final Map<String, Process> _activeProcesses = {};
   final Map<String, String> _activeAssistantMsgIds = {};
+  final Map<String, List<String>> _queuedWakeupPrompts = {};
 
   AgyBrainBridge({
     required this.store,
@@ -349,6 +350,60 @@ class AgyBrainBridge {
         ),
       );
     }
+
+    // Drain any queued async remote-command completion events for this session
+    final queued = _queuedWakeupPrompts.remove(sessionId);
+    if (queued != null && queued.isNotEmpty) {
+      final combined = queued.join('\n\n');
+      unawaited(runPromptTurn(
+        sessionId: sessionId,
+        userPrompt: combined,
+      ));
+    }
+  }
+
+  /// Automatically triggered by `NodeRegistry` when a detached/async remote task
+  /// finishes on a client computer. Resumes the session's Brain turn reactively!
+  void handleAsyncTaskCompletion(
+    String sessionId,
+    RemoteTaskInfo taskInfo,
+    ExecResult res,
+  ) {
+    final session = store.getSession(sessionId);
+    if (session == null) return;
+
+    final outTrim = res.stdout.length > 8000
+        ? '...[truncated]...\n${res.stdout.substring(res.stdout.length - 8000)}'
+        : res.stdout;
+    final errTrim = res.stderr.length > 4000
+        ? '...[truncated]...\n${res.stderr.substring(res.stderr.length - 4000)}'
+        : res.stderr;
+
+    final buf = StringBuffer()
+      ..writeln('🔔 [ASYNC REMOTE COMMAND COMPLETED]')
+      ..writeln('- Task ID  : ${taskInfo.taskId}')
+      ..writeln('- Computer : ${taskInfo.nodeHostname} (${taskInfo.nodeId})')
+      ..writeln('- Command  : ${taskInfo.command}')
+      ..writeln('- Exit Code: ${res.exitCode} (${(res.durationMs / 1000.0).toStringAsFixed(1)}s)');
+    if (outTrim.trim().isNotEmpty) {
+      buf.writeln('--- STDOUT ---\n$outTrim');
+    }
+    if (errTrim.trim().isNotEmpty) {
+      buf.writeln('--- STDERR ---\n$errTrim');
+    }
+    buf.writeln(
+      '\nReview the completed async command output above and continue the task or summarize the outcome for the user.',
+    );
+
+    final wakeupText = buf.toString();
+    if (isSessionRunning(sessionId)) {
+      _queuedWakeupPrompts.putIfAbsent(sessionId, () => []).add(wakeupText);
+    } else {
+      unawaited(runPromptTurn(
+        sessionId: sessionId,
+        userPrompt: wakeupText,
+      ));
+    }
   }
 
   String _buildContextualizedPrompt({
@@ -382,7 +437,9 @@ class AgyBrainBridge {
     }
     buf
       ..writeln(
-          '- Instructions: Always pass session_id="${session.sessionId}" when calling $mcpServerName MCP tools (mesh_exec, mesh_read_file, mesh_write_file, mesh_edit_file, mesh_list_dir) so paths resolve relative to remote_workspace_path and live tool progress streams to this session. Do NOT run local commands on the Brain host unless explicitly asked; operate on target_computer via MCP tools.')
+          '- Instructions: Always pass session_id="${session.sessionId}" when calling $mcpServerName MCP tools (mesh_exec, mesh_task_status, mesh_list_tasks, mesh_kill_task, mesh_read_file, mesh_write_file, mesh_edit_file, mesh_list_dir) so paths resolve relative to remote_workspace_path and live tool progress streams to this session. Do NOT run local commands on the Brain host unless explicitly asked; operate on target_computer via MCP tools.')
+      ..writeln(
+          '- Long-Running & Async Commands: Remote commands in mesh_exec are backed by continuous 5s client heartbeats and are NEVER killed at 180s. For long tasks (builds, installs, tests), you can EITHER pass background=true to mesh_exec and end your turn (the server will automatically wake this session up when the client finishes the command!), OR call mesh_task_status(task_id=..., wait_sec=90) to wait while heartbeats stay healthy.')
       ..writeln('[/AGY LAN Mesh Session Context]')
       ..writeln()
       ..write(userPrompt);

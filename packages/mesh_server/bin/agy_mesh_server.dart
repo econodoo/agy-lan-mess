@@ -57,10 +57,20 @@ Future<void> main(List<String> arguments) async {
       help: 'Run a live 1-turn Antigravity quota & connectivity ping',
     );
 
+  final tasksParser = ArgParser()
+    ..addOption('url', defaultsTo: 'http://127.0.0.1:8765')
+    ..addOption(
+      'wait',
+      abbr: 'w',
+      defaultsTo: '0',
+      help: 'Seconds to wait when checking "tasks status <taskId>"',
+    );
+
   parser
     ..addCommand('start', startParser)
     ..addCommand('sessions', sessionsParser)
     ..addCommand('nodes', nodesParser)
+    ..addCommand('tasks', tasksParser)
     ..addCommand('doctor', doctorParser);
 
   ArgResults results;
@@ -101,6 +111,8 @@ Future<void> main(List<String> arguments) async {
     await _runSessionsCli(cmd);
   } else if (cmd.name == 'nodes') {
     await _runNodesCli(cmd);
+  } else if (cmd.name == 'tasks') {
+    await _runTasksCli(cmd);
   } else if (cmd.name == 'doctor') {
     await _runDoctorCli(cmd);
   }
@@ -376,11 +388,89 @@ String _detectProjectRoot() {
   return Directory.current.path;
 }
 
+Future<void> _runTasksCli(ArgResults cmd) async {
+  final baseUrl = cmd['url'] as String;
+  final waitSec = int.tryParse(cmd['wait'] as String? ?? '0') ?? 0;
+  final rest = cmd.rest;
+  final action = rest.isEmpty ? 'list' : rest.first;
+  final client = HttpClient();
+  try {
+    switch (action) {
+      case 'list':
+      case 'ls':
+        final data = await _httpJson(client, 'GET', '$baseUrl/api/tasks');
+        final tasks = data['tasks'] as List<dynamic>? ?? [];
+        if (tasks.isEmpty) {
+          stdout.writeln('No active or recent remote tasks.');
+          return;
+        }
+        stdout.writeln(
+          '${"STATUS".padRight(14)} ${"HB".padRight(6)} ${"PID".padRight(8)} ${"ELAPSED".padRight(10)} ${"NODE".padRight(18)} ${"TASK ID".padRight(38)} COMMAND',
+        );
+        stdout.writeln('-' * 116);
+        for (final item in tasks) {
+          final t = item as Map<String, dynamic>;
+          final hb = (t['heartbeatHealthy'] as bool? ?? false) ? 'OK' : 'STALE';
+          final pid = '${t["pid"] ?? "-"}';
+          final sec =
+              (((t['elapsedMs'] as num?)?.toInt() ?? 0) / 1000.0).toStringAsFixed(1);
+          stdout.writeln(
+            '${(t["status"] as String).padRight(14)} '
+            '${hb.padRight(6)} '
+            '${pid.padRight(8)} '
+            '${"${sec}s".padRight(10)} '
+            '${(t["nodeHostname"] as String).padRight(18)} '
+            '${(t["taskId"] as String).padRight(38)} '
+            '${t["command"]}',
+          );
+        }
+        break;
+
+      case 'status':
+        if (rest.length < 2) {
+          stderr.writeln('Usage: agy-mesh-server tasks status <taskId> [--wait 30]');
+          exit(64);
+        }
+        final data = await _httpJson(
+          client,
+          'GET',
+          '$baseUrl/api/tasks/${rest[1]}?wait=$waitSec',
+        );
+        stdout.writeln(const JsonEncoder.withIndent('  ').convert(data));
+        break;
+
+      case 'kill':
+        if (rest.length < 2) {
+          stderr.writeln('Usage: agy-mesh-server tasks kill <taskId>');
+          exit(64);
+        }
+        final data = await _httpJson(
+          client,
+          'POST',
+          '$baseUrl/api/tasks/${rest[1]}/kill',
+          body: {},
+        );
+        stdout.writeln('Kill task ${rest[1]}: ${data["killed"]}');
+        break;
+
+      default:
+        stderr.writeln(
+          'Unknown tasks action "$action". Use: list | status <taskId> | kill <taskId>',
+        );
+        exit(64);
+    }
+  } finally {
+    client.close();
+  }
+}
+
 void _printUsage(ArgParser parser, ArgParser startParser) {
   stdout.writeln('AGY LAN Mesh Hub & MCP Server');
   stdout.writeln('\nUsage:');
   stdout.writeln('  agy-mesh-server start [flags]');
+  stdout.writeln('  agy-mesh-server doctor [--ping]');
   stdout.writeln('  agy-mesh-server nodes [--url http://127.0.0.1:8765]');
+  stdout.writeln('  agy-mesh-server tasks <list|status <id>|kill <id>> [--wait N]');
   stdout.writeln(
     '  agy-mesh-server sessions <list|new|stop|delete> [options]',
   );

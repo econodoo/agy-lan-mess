@@ -64,8 +64,9 @@ class MeshAppController extends ChangeNotifier {
   bool needsPin = false;
   String? connectionError;
 
-  // Fleet & Multi-Session State
+  // Fleet, Remote Tasks & Multi-Session State
   List<NodeInfo> nodes = [];
+  List<RemoteTaskInfo> remoteTasks = [];
   List<Map<String, dynamic>> sessionSummaries = [];
   final Map<String, MeshSession> sessionDetails = {};
   String? selectedSessionId;
@@ -249,6 +250,7 @@ class MeshAppController extends ChangeNotifier {
         await _prefs?.setString('mesh_token', token);
 
         _ingestNodes(p['nodes'] as List<dynamic>?);
+        _ingestTasks(p['tasks'] as List<dynamic>?);
         _ingestSessions(p['sessions'] as List<dynamic>?);
         if (selectedSessionId != null) {
           requestSessionDetail(selectedSessionId!);
@@ -274,6 +276,11 @@ class MeshAppController extends ChangeNotifier {
 
       case WsTypes.fleetSnapshot:
         _ingestNodes(p['nodes'] as List<dynamic>?);
+        notifyListeners();
+        break;
+
+      case WsTypes.tasksSnapshot:
+        _ingestTasks(p['tasks'] as List<dynamic>?);
         notifyListeners();
         break;
 
@@ -317,6 +324,22 @@ class MeshAppController extends ChangeNotifier {
         unawaited(_handleIncomingExecRpc(ExecRequest.fromJson(p)));
         break;
 
+      case WsTypes.rpcTaskKill:
+        final killId = p['requestId'] as String? ?? '';
+        if (killId.isNotEmpty) {
+          auditLog.insert(
+            0,
+            AuditLogEntry(
+              category: 'exec',
+              summary: '🛑 KILL REQUESTED for task #${killId.length > 8 ? killId.substring(0, 8) : killId}',
+              isError: true,
+            ),
+          );
+          notifyListeners();
+          unawaited(driver.killRunningCommand(killId));
+        }
+        break;
+
       case WsTypes.rpcFileOp:
         unawaited(_handleIncomingFileOpRpc(FileOpRequest.fromJson(p)));
         break;
@@ -328,6 +351,21 @@ class MeshAppController extends ChangeNotifier {
     nodes = rawNodes
         .map((e) => NodeInfo.fromJson(Map<String, dynamic>.from(e as Map)))
         .toList();
+  }
+
+  void _ingestTasks(List<dynamic>? rawTasks) {
+    if (rawTasks == null) return;
+    remoteTasks = rawTasks
+        .map((e) =>
+            RemoteTaskInfo.fromJson(Map<String, dynamic>.from(e as Map)))
+        .toList();
+  }
+
+  void killRemoteTask(String taskId) {
+    _send(WsEnvelope(
+      type: WsTypes.taskKillRequest,
+      payload: {'taskId': taskId},
+    ));
   }
 
   void _ingestSessions(List<dynamic>? rawSessions) {
@@ -391,6 +429,19 @@ class MeshAppController extends ChangeNotifier {
   // ---------------- Local Target Node RPC Execution ----------------
 
   Future<void> _handleIncomingExecRpc(ExecRequest req) async {
+    final shortId =
+        req.requestId.length > 8 ? req.requestId.substring(0, 8) : req.requestId;
+    auditLog.insert(
+      0,
+      AuditLogEntry(
+        category: 'exec',
+        summary:
+            '📥 RECEIVED [#$shortId] ${req.elevated ? "(ELEVATED) " : ""}${req.command}',
+        detail: 'cwd: ${req.cwd ?? localCwd}',
+      ),
+    );
+    notifyListeners();
+
     var approved = true;
     if (req.elevated && approvalMode == ApprovalModes.askForElevated) {
       _send(WsEnvelope(
@@ -412,7 +463,7 @@ class MeshAppController extends ChangeNotifier {
         0,
         AuditLogEntry(
           category: 'security',
-          summary: 'DENIED elevated command: ${req.command}',
+          summary: 'DENIED elevated command [#$shortId]: ${req.command}',
           isError: true,
         ),
       );
@@ -430,13 +481,36 @@ class MeshAppController extends ChangeNotifier {
       return;
     }
 
-    final res = await driver.executeCommand(req);
+    var loggedRunningStart = false;
+    final res = await driver.executeCommand(
+      req,
+      onHeartbeat: (hb) {
+        _send(WsEnvelope(
+          type: WsTypes.rpcExecHeartbeat,
+          payload: hb.toJson(),
+        ));
+        if (!loggedRunningStart) {
+          loggedRunningStart = true;
+          auditLog.insert(
+            0,
+            AuditLogEntry(
+              category: 'exec',
+              summary:
+                  '🚀 RUNNING [#$shortId] PID ${hb.pid ?? "?"}: ${req.command}',
+              detail: 'Sending live 5s heartbeats to Hub...',
+            ),
+          );
+          notifyListeners();
+        }
+      },
+    );
+    final sec = (res.durationMs / 1000.0).toStringAsFixed(1);
     auditLog.insert(
       0,
       AuditLogEntry(
         category: 'exec',
         summary:
-            '[exit ${res.exitCode}] ${req.elevated ? "(ELEVATED) " : ""}${req.command}',
+            '${res.exitCode == 0 ? "✅ COMPLETED" : "❌ FAILED"} [#$shortId • exit ${res.exitCode} • ${sec}s] ${req.elevated ? "(ELEVATED) " : ""}${req.command}',
         detail: (res.stdout.isNotEmpty ? res.stdout : res.stderr).trim(),
         isError: res.exitCode != 0,
       ),

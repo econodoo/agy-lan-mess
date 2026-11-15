@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import select
+import signal
 import socket
 import ssl
 import struct
@@ -240,6 +241,8 @@ class TargetNodeAgent:
         self.active_session_id = None
         self.ws: MinimalWsClient | None = None
         self._prompt_lock = threading.Lock()
+        self._running_procs: dict[str, subprocess.Popen] = {}
+        self._procs_lock = threading.Lock()
 
     def build_node_info(self) -> dict:
         now = datetime.now(timezone.utc).isoformat()
@@ -269,13 +272,47 @@ class TargetNodeAgent:
             except Exception:
                 return input(question).strip()
 
+    def handle_task_kill(self, payload: dict):
+        req_id = payload.get("requestId", "")
+        with self._procs_lock:
+            proc = self._running_procs.get(req_id)
+        if not proc:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
+                time.sleep(2.0)
+                if proc.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+        except Exception:
+            pass
+
     def handle_exec(self, payload: dict):
         req_id = payload.get("requestId", "")
+        short_id = req_id[:8] if req_id else "cmd"
         cmd = payload.get("command", "")
         cwd = payload.get("cwd") or self.cwd
         elevated = bool(payload.get("elevated", False))
-        timeout_sec = int(payload.get("timeoutSec", 120))
+        timeout_sec = int(payload.get("timeoutSec", 0) or 0)
         sess_title = payload.get("requestingSessionTitle") or "AGY Brain"
+
+        print(
+            f"\n📥 [Received #{short_id}] ({sess_title}) {'[ELEVATED] ' if elevated else ''}{cmd}\n"
+            f"   └─ cwd: {cwd}",
+            flush=True,
+        )
 
         if elevated and self.approval_mode == "askForElevated":
             self.ws.send_text(json.dumps({
@@ -310,6 +347,10 @@ class TargetNodeAgent:
                 return
 
         t0 = time.monotonic()
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+        buf_lock = threading.Lock()
+
         try:
             stdin_bytes = None
             if os.name == "nt":
@@ -323,47 +364,145 @@ class TargetNodeAgent:
             else:
                 run_args = ["bash", "-c", cmd]
 
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 run_args,
-                input=stdin_bytes,
+                stdin=subprocess.PIPE if stdin_bytes else subprocess.DEVNULL,
                 cwd=cwd if os.path.isdir(cwd) else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=timeout_sec,
+                start_new_session=(os.name != "nt"),
             )
+            with self._procs_lock:
+                self._running_procs[req_id] = proc
+
+            print(f"🚀 [Running  #{short_id}] PID {proc.pid} started...", flush=True)
+
+            if stdin_bytes and proc.stdin:
+                try:
+                    proc.stdin.write(stdin_bytes)
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                finally:
+                    proc.stdin.close()
+
+            def _drain(pipe, target_list):
+                try:
+                    while True:
+                        chunk = pipe.read(4096)
+                        if not chunk:
+                            break
+                        text_piece = chunk.decode("utf-8", errors="replace")
+                        with buf_lock:
+                            target_list.append(text_piece)
+                except Exception:
+                    pass
+
+            t_out = threading.Thread(target=_drain, args=(proc.stdout, out_chunks), daemon=True)
+            t_err = threading.Thread(target=_drain, args=(proc.stderr, err_chunks), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            def send_hb():
+                if not self.ws or self.ws.closed:
+                    return
+                with buf_lock:
+                    full_out = "".join(out_chunks)
+                    full_err = "".join(err_chunks)
+                try:
+                    self.ws.send_text(json.dumps({
+                        "type": "rpc.exec_heartbeat",
+                        "payload": {
+                            "requestId": req_id,
+                            "pid": proc.pid,
+                            "alive": proc.poll() is None,
+                            "elapsedMs": int((time.monotonic() - t0) * 1000),
+                            "stdoutBytes": len(full_out),
+                            "stderrBytes": len(full_err),
+                            "stdoutTail": full_out[-2000:],
+                            "stderrTail": full_err[-1000:],
+                        },
+                    }))
+                except Exception:
+                    pass
+
+            send_hb()
+            last_hb = time.monotonic()
+            last_console_hb = last_hb
+            timed_out = False
+
+            while proc.poll() is None:
+                now_m = time.monotonic()
+                if timeout_sec > 0 and (now_m - t0) >= timeout_sec:
+                    timed_out = True
+                    self.handle_task_kill({"requestId": req_id})
+                    break
+                if (now_m - last_hb) >= 5.0:
+                    send_hb()
+                    last_hb = now_m
+                if (now_m - last_console_hb) >= 10.0:
+                    with buf_lock:
+                        n_out = sum(len(x) for x in out_chunks)
+                        n_err = sum(len(x) for x in err_chunks)
+                    print(
+                        f"💓 [Alive    #{short_id}] PID {proc.pid} running ({now_m - t0:.1f}s elapsed, stdout={n_out}B, stderr={n_err}B)",
+                        flush=True,
+                    )
+                    last_console_hb = now_m
+                time.sleep(0.4)
+
+            t_out.join(timeout=2.0)
+            t_err.join(timeout=2.0)
+            with self._procs_lock:
+                self._running_procs.pop(req_id, None)
+
             dur = int((time.monotonic() - t0) * 1000)
-            self.ws.send_text(json.dumps({
-                "type": "rpc.exec_result",
-                "payload": {
-                    "requestId": req_id,
-                    "exitCode": proc.returncode,
-                    "stdout": proc.stdout.decode("utf-8", errors="replace"),
-                    "stderr": proc.stderr.decode("utf-8", errors="replace"),
-                    "approved": True,
-                    "durationMs": dur,
-                },
-            }))
-        except subprocess.TimeoutExpired:
-            dur = int((time.monotonic() - t0) * 1000)
-            self.ws.send_text(json.dumps({
-                "type": "rpc.exec_result",
-                "payload": {
-                    "requestId": req_id,
-                    "exitCode": 124,
-                    "stdout": "",
-                    "stderr": f"Timed out after {timeout_sec}s",
-                    "approved": True,
-                    "durationMs": dur,
-                },
-            }))
+            with buf_lock:
+                stdout_str = "".join(out_chunks)
+                stderr_str = "".join(err_chunks)
+
+            code_val = 124 if timed_out else (proc.returncode if proc.returncode is not None else -1)
+            icon = "✅" if code_val == 0 else "❌"
+            print(
+                f"{icon} [Finished #{short_id}] PID {proc.pid} exit={code_val} in {dur / 1000.0:.2f}s (stdout={len(stdout_str)}B, stderr={len(stderr_str)}B)",
+                flush=True,
+            )
+
+            if timed_out:
+                self.ws.send_text(json.dumps({
+                    "type": "rpc.exec_result",
+                    "payload": {
+                        "requestId": req_id,
+                        "exitCode": 124,
+                        "stdout": stdout_str,
+                        "stderr": (stderr_str + f"\nReached explicit hard timeout ({timeout_sec}s)").strip(),
+                        "approved": True,
+                        "durationMs": dur,
+                        "errorMessage": "Hard timeout",
+                    },
+                }))
+            else:
+                self.ws.send_text(json.dumps({
+                    "type": "rpc.exec_result",
+                    "payload": {
+                        "requestId": req_id,
+                        "exitCode": proc.returncode if proc.returncode is not None else -1,
+                        "stdout": stdout_str,
+                        "stderr": stderr_str,
+                        "approved": True,
+                        "durationMs": dur,
+                    },
+                }))
         except Exception as e:
+            with self._procs_lock:
+                self._running_procs.pop(req_id, None)
             dur = int((time.monotonic() - t0) * 1000)
             self.ws.send_text(json.dumps({
                 "type": "rpc.exec_result",
                 "payload": {
                     "requestId": req_id,
                     "exitCode": -1,
-                    "stdout": "",
+                    "stdout": "".join(out_chunks),
                     "stderr": str(e),
                     "approved": True,
                     "durationMs": dur,
@@ -376,6 +515,7 @@ class TargetNodeAgent:
         op = payload.get("op", "read")
         raw_path = os.path.expanduser(payload.get("path", ""))
         target_path = Path(raw_path) if os.path.isabs(raw_path) else (Path(self.cwd) / raw_path)
+        print(f"📄 [FileOp] {op.upper()} {target_path}", flush=True)
 
         try:
             if op == "read":
@@ -509,6 +649,9 @@ class TargetNodeAgent:
 
                     elif mtype == "rpc.exec":
                         threading.Thread(target=self.handle_exec, args=(payload,), daemon=True).start()
+
+                    elif mtype == "rpc.task_kill":
+                        threading.Thread(target=self.handle_task_kill, args=(payload,), daemon=True).start()
 
                     elif mtype == "rpc.file_op":
                         threading.Thread(target=self.handle_file_op, args=(payload,), daemon=True).start()

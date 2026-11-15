@@ -80,16 +80,41 @@ void main() {
           authCompleter.complete(env.payload);
         } else if (env.type == WsTypes.rpcExec) {
           final req = ExecRequest.fromJson(env.payload);
-          ws.sink.add(WsEnvelope(
-            type: WsTypes.rpcExecResult,
-            payload: ExecResult(
-              requestId: req.requestId,
-              exitCode: 0,
-              stdout: 'EXEC_OK:${req.command}@${req.cwd}',
-              stderr: '',
-              durationMs: 5,
-            ).toJson(),
-          ).encode());
+          if (req.command == 'LONG_BUILD') {
+            ws.sink.add(WsEnvelope(
+              type: WsTypes.rpcExecHeartbeat,
+              payload: ExecHeartbeat(
+                requestId: req.requestId,
+                pid: 7777,
+                alive: true,
+                elapsedMs: 300,
+                stdoutTail: 'Compiling step 1/2...',
+              ).toJson(),
+            ).encode());
+            Future<void>.delayed(const Duration(milliseconds: 1600), () {
+              ws.sink.add(WsEnvelope(
+                type: WsTypes.rpcExecResult,
+                payload: ExecResult(
+                  requestId: req.requestId,
+                  exitCode: 0,
+                  stdout: 'LONG_BUILD_COMPLETED_OK',
+                  stderr: '',
+                  durationMs: 1600,
+                ).toJson(),
+              ).encode());
+            });
+          } else {
+            ws.sink.add(WsEnvelope(
+              type: WsTypes.rpcExecResult,
+              payload: ExecResult(
+                requestId: req.requestId,
+                exitCode: 0,
+                stdout: 'EXEC_OK:${req.command}@${req.cwd}',
+                stderr: '',
+                durationMs: 5,
+              ).toJson(),
+            ).encode());
+          }
         } else if (env.type == WsTypes.rpcFileOp) {
           final req = FileOpRequest.fromJson(env.payload);
           final file = File(req.path);
@@ -225,6 +250,32 @@ void main() {
         'session_id': sess1Id,
       });
       expect(readBack, 'Hello Antigravity Mesh');
+
+      // 5. Verify heartbeat-backed long task detaches cleanly & mesh_task_status retrieves completion
+      final longStartOut = await callMcpTool('mesh_exec', {
+        'node': 'SIM-WIN-PC',
+        'command': 'LONG_BUILD',
+        'wait_sec': 1,
+      });
+      expect(longStartOut, contains('STILL RUNNING'));
+      expect(longStartOut, contains('7777'));
+      expect(longStartOut, contains('Compiling step 1/2...'));
+
+      final idMatch = RegExp(r'Task ID\s*:\s*([a-f0-9\-]+)').firstMatch(longStartOut);
+      expect(idMatch, isNotNull);
+      final taskId = idMatch!.group(1)!;
+
+      final listTasksOut = await callMcpTool('mesh_list_tasks', {
+        'node': 'SIM-WIN-PC',
+      });
+      expect(listTasksOut, contains(taskId));
+
+      final finalTaskOut = await callMcpTool('mesh_task_status', {
+        'task_id': taskId,
+        'wait_sec': 5,
+      });
+      expect(finalTaskOut, contains('LONG_BUILD_COMPLETED_OK'));
+      expect(finalTaskOut, contains('Exit Code: 0'));
 
       await ws.sink.close();
     });
