@@ -19,3 +19,6 @@ apps/mesh_client/android/**/GeneratedPluginRegistrant.java
 *.iml
 *.log
 .DS_Store
+
+__pycache__/
+*.pyc
