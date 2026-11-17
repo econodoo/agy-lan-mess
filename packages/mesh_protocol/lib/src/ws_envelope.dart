@@ -17,6 +17,7 @@ class WsTypes {
   static const String sessionUpdate = 'session.update';
   static const String sessionDelete = 'session.delete';
   static const String sessionGet = 'session.get';
+  static const String sessionSummarize = 'session.summarize';
   static const String browseRemoteDir = 'fleet.browse_dir';
   static const String browseRemoteDirResult = 'fleet.browse_dir_result';
 

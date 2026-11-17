@@ -279,5 +279,104 @@ void main() {
 
       await ws.sink.close();
     });
+
+    test('Streams Brain turn without leaking <session_summary> tag and appends Brag Summary Card', () async {
+      // Holdback & extraction unit checks
+      expect(
+        AgyBrainBridge.computeSafeStreamingLength('Hello world <sess'),
+        'Hello world '.length,
+      );
+      expect(
+        AgyBrainBridge.computeSafeStreamingLength('a < b is true'),
+        'a < b is true'.length,
+      );
+
+      final fakeAgy = File(p.join(tempDir.path, 'fake_agy.sh'));
+      await fakeAgy.writeAsString(r'''#!/usr/bin/env bash
+cat << 'EOF'
+{"event":"init","conversation_id":"conv-test-99"}
+{"event":"step_update","step_update":{"text_delta":"Fixed the port conflict and restarted the service.\n\n<session_"}}
+{"event":"step_update","step_update":{"text_delta":"summary>{\"issue\":\"Port 8080 conflict on dev server\",\"findings\":\"Stale node process held 8080\",\"what_we_did\":\"Terminated stale PID and restarted systemd unit\"}</session_summary>"}}
+{"event":"result","result":{"conversation_id":"conv-test-99","usage":{"input_tokens":4200,"output_tokens":350,"thinking_tokens":650}}}
+EOF
+''');
+      await Process.run('chmod', ['+x', fakeAgy.path]);
+
+      final mockHub = MeshHubServer(
+        port: 0,
+        discoveryPort: 0,
+        host: '127.0.0.1',
+        projectRoot: p.normalize(p.join(Directory.current.path, '..', '..')),
+        stateDir: p.join(tempDir.path, 'mock_hub_state'),
+        agyExecutable: fakeAgy.path,
+      );
+      await mockHub.start(overridePin: '123456');
+
+      try {
+        final sess = mockHub.store.createSession(
+          title: 'Dev Server Port Fix',
+          targetNodeId: '*',
+          targetNodeName: 'ubuntu-dev',
+          workspacePath: '/srv/app',
+        );
+
+        final streamedDeltas = <String>[];
+        final summaryCompleter = Completer<Map<String, dynamic>>();
+        final subWs = WebSocketChannel.connect(
+          Uri.parse('ws://127.0.0.1:${mockHub.boundPort}/ws'),
+        );
+        await subWs.ready;
+        final authOk = Completer<void>();
+        subWs.stream.listen((raw) {
+          final env = WsEnvelope.decode(raw as String);
+          if (env.type == WsTypes.authOk && !authOk.isCompleted) {
+            authOk.complete();
+          } else if (env.type == WsTypes.chatEvent) {
+            if (env.payload['kind'] == 'text_delta') {
+              streamedDeltas.add(env.payload['delta'] as String);
+            } else if (env.payload['kind'] == 'session_summary' &&
+                !summaryCompleter.isCompleted) {
+              summaryCompleter.complete(
+                Map<String, dynamic>.from(env.payload['summary'] as Map),
+              );
+            }
+          }
+        });
+        subWs.sink.add(const WsEnvelope(
+          type: WsTypes.authHello,
+          payload: {'registerAsNode': false, 'nodeInfo': {}},
+        ).encode());
+        await authOk.future;
+
+        await mockHub.brain.runPromptTurn(
+          sessionId: sess.sessionId,
+          userPrompt: 'Why is port 8080 failing?',
+        );
+
+        final summaryEvent = await summaryCompleter.future.timeout(
+          const Duration(seconds: 5),
+        );
+        final fullStreamed = streamedDeltas.join();
+        expect(fullStreamed, contains('Fixed the port conflict'));
+        expect(fullStreamed, isNot(contains('<session_summary>')));
+        expect(summaryEvent['issue'], 'Port 8080 conflict on dev server');
+        expect(summaryEvent['findings'], 'Stale node process held 8080');
+        expect(
+          summaryEvent['actionsTaken'],
+          'Terminated stale PID and restarted systemd unit',
+        );
+        expect(summaryEvent['inputTokens'], 4200);
+        expect(summaryEvent['outputTokens'], 350);
+        expect(summaryEvent['thinkingTokens'], 650);
+
+        final finalSess = mockHub.store.getSession(sess.sessionId)!;
+        expect(finalSess.messages.last.role, 'summary');
+        expect(finalSess.latestSummary!.totalTokens, 5200);
+
+        await subWs.sink.close();
+      } finally {
+        await mockHub.stop();
+      }
+    });
   });
 }

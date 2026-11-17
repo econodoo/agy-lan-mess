@@ -30,7 +30,7 @@ Future<void> main(List<String> arguments) async {
     )
     ..addFlag(
       'expose-local-node',
-      defaultsTo: false,
+      defaultsTo: true,
       help: 'Also expose the Brain Server host itself as a controllable node',
     )
     ..addFlag(
@@ -258,6 +258,21 @@ Future<void> _runSessionsCli(ArgResults cmd) async {
         stdout.writeln('Session ${rest[1]} cancel result: ${res["cancelled"]}');
         break;
 
+      case 'summarize':
+      case 'summary':
+        if (rest.length < 2) {
+          stderr.writeln('Usage: agy-mesh-server sessions summarize <sessionId>');
+          exit(64);
+        }
+        final res = await _httpJson(
+          client,
+          'POST',
+          '$baseUrl/api/sessions/${rest[1]}/summarize',
+          body: {},
+        );
+        stdout.writeln(res['markdown'] ?? res['summary']);
+        break;
+
       case 'delete':
       case 'rm':
         if (rest.length < 2) {
@@ -274,7 +289,7 @@ Future<void> _runSessionsCli(ArgResults cmd) async {
 
       default:
         stderr.writeln(
-          'Unknown sessions action "$action". Use: list | new | stop <id> | delete <id>',
+          'Unknown sessions action "$action". Use: list | new | summarize <id> | stop <id> | delete <id>',
         );
         exit(64);
     }
@@ -374,10 +389,13 @@ Future<Map<String, dynamic>> _httpJson(
 }
 
 String _detectProjectRoot() {
+  final exeDir = File(Platform.resolvedExecutable).parent.path;
   final candidates = [
+    exeDir,
+    p.normalize(p.join(exeDir, '..')),
+    p.normalize(p.join(exeDir, '..', '..')),
     Directory.current.path,
     p.normalize(p.join(Directory.current.path, '..', '..')),
-    p.normalize(p.join(File(Platform.resolvedExecutable).parent.path, '..')),
   ];
   for (final dir in candidates) {
     if (Directory(p.join(dir, 'scripts')).existsSync() ||
@@ -385,7 +403,7 @@ String _detectProjectRoot() {
       return dir;
     }
   }
-  return Directory.current.path;
+  return exeDir;
 }
 
 Future<void> _runTasksCli(ArgResults cmd) async {
@@ -472,7 +490,7 @@ void _printUsage(ArgParser parser, ArgParser startParser) {
   stdout.writeln('  agy-mesh-server nodes [--url http://127.0.0.1:8765]');
   stdout.writeln('  agy-mesh-server tasks <list|status <id>|kill <id>> [--wait N]');
   stdout.writeln(
-    '  agy-mesh-server sessions <list|new|stop|delete> [options]',
+    '  agy-mesh-server sessions <list|new|summarize|stop|delete> [options]',
   );
   stdout.writeln('\nStart Flags:');
   stdout.writeln(startParser.usage);

@@ -98,17 +98,63 @@ class MeshAppController extends ChangeNotifier {
     final savedUrl = _prefs?.getString('mesh_ws_url');
     if (savedUrl != null && savedUrl.isNotEmpty) {
       wsUrl = savedUrl;
+      if (driver.isDesktopTarget && _isLoopbackWsUrl(wsUrl)) {
+        await driver.ensureLocalHubRunning();
+      }
     } else {
       wsUrl = driver.defaultInitialWsUrl();
       if (!driver.isWebConsole) {
-        final discovered = await driver.discoverLanHub();
-        if (discovered != null) {
-          wsUrl = discovered.wsUrl;
+        final localStatus =
+            driver.isDesktopTarget ? await driver.probeLocalHubStatus() : null;
+        if (localStatus != null) {
+          wsUrl = 'ws://127.0.0.1:8765/ws';
+        } else {
+          final discovered = await driver.discoverLanHub();
+          if (discovered != null) {
+            wsUrl = discovered.wsUrl;
+          } else if (driver.isDesktopTarget) {
+            final booted = await driver.ensureLocalHubRunning();
+            if (booted) {
+              wsUrl = 'ws://127.0.0.1:8765/ws';
+            }
+          }
         }
       }
     }
+
+    if (driver.isDesktopTarget &&
+        _isLoopbackWsUrl(wsUrl) &&
+        token.isEmpty &&
+        pairingPinInput.isEmpty) {
+      final st = await driver.probeLocalHubStatus();
+      final pin = st?['pairingPin'] as String?;
+      if (pin != null && pin.isNotEmpty) {
+        pairingPinInput = pin;
+      }
+    }
+
     notifyListeners();
     unawaited(connect());
+  }
+
+  static bool _isLoopbackWsUrl(String url) {
+    try {
+      final h = Uri.parse(url).host;
+      return h == '127.0.0.1' || h == 'localhost' || h == '::1';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> startLocalHubServer() async {
+    final ok = await driver.ensureLocalHubRunning(force: true);
+    if (ok) {
+      wsUrl = 'ws://127.0.0.1:8765/ws';
+      final st = await driver.probeLocalHubStatus();
+      final pin = st?['pairingPin'] as String?;
+      await connect(newWsUrl: wsUrl, pin: pin);
+    }
+    return ok;
   }
 
   Future<String?> autoDiscoverHub() async {
@@ -727,6 +773,13 @@ class MeshAppController extends ChangeNotifier {
     ));
   }
 
+  void requestSessionSummary(String sessionId) {
+    _send(WsEnvelope(
+      type: WsTypes.sessionSummarize,
+      payload: {'sessionId': sessionId},
+    ));
+  }
+
   // ---------------- Brain Diagnostics, Model & Rollout Helpers ----------------
 
   void refreshBrainStatus() {
@@ -793,6 +846,7 @@ class MeshAppController extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _wsSub?.cancel();
     _channel?.sink.close();
+    driver.stopSpawnedLocalHub();
     super.dispose();
   }
 }

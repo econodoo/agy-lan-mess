@@ -487,6 +487,16 @@ class _MeshHomePageState extends State<MeshHomePage> {
                 style: TextStyle(color: cs.onErrorContainer, fontSize: 13),
               ),
             ),
+            if (c.driver.hasBundledServerBinary && !c.needsPin) ...[
+              FilledButton.icon(
+                onPressed: () async {
+                  await c.startLocalHubServer();
+                },
+                icon: const Icon(Icons.play_arrow, size: 17),
+                label: const Text('Start Local Hub'),
+              ),
+              const SizedBox(width: 8),
+            ],
             FilledButton.tonal(
               onPressed: _openConnectionSheet,
               child: Text(c.needsPin ? 'Enter PIN' : 'Configure Hub'),
@@ -763,7 +773,9 @@ class _MeshHomePageState extends State<MeshHomePage> {
                           ),
                           Text(
                             'Target: ${session.targetNodeName.isNotEmpty ? session.targetNodeName : session.targetNodeId}'
-                            '${session.workspacePath.isNotEmpty ? "  •  Folder: ${session.workspacePath}" : ""}',
+                            '${session.workspacePath.isNotEmpty ? "  •  Folder: ${session.workspacePath}" : ""}'
+                            '${session.totalActiveDurationMs > 0 ? "  •  ⏱ ${SessionCompletionSummary.formatDuration(session.totalActiveDurationMs)}" : ""}'
+                            '${session.totalTokens > 0 ? "  •  🪙 ${SessionCompletionSummary.formatTokens(session.totalTokens)} tok" : ""}',
                             style: TextStyle(
                               fontSize: 12,
                               color: cs.onSurfaceVariant,
@@ -773,6 +785,33 @@ class _MeshHomePageState extends State<MeshHomePage> {
                       ),
               ),
               if (session != null) ...[
+                if (session.messages.isNotEmpty && !isRunning)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: isWide
+                        ? OutlinedButton.icon(
+                            onPressed: () =>
+                                c.requestSessionSummary(session.sessionId),
+                            icon: const Icon(
+                              Icons.workspace_premium_outlined,
+                              size: 16,
+                            ),
+                            label: Text(
+                              session.latestSummary != null
+                                  ? 'Refresh Summary'
+                                  : 'Summary Card',
+                            ),
+                          )
+                        : IconButton(
+                            tooltip: 'Generate Session Summary Card',
+                            icon: const Icon(
+                              Icons.workspace_premium_outlined,
+                              size: 19,
+                            ),
+                            onPressed: () =>
+                                c.requestSessionSummary(session.sessionId),
+                          ),
+                  ),
                 IconButton(
                   tooltip: 'Change Target Machine / Project Folder',
                   icon: const Icon(Icons.tune, size: 18),
@@ -872,8 +911,10 @@ class _MeshHomePageState extends State<MeshHomePage> {
                   controller: _scrollCtrl,
                   padding: const EdgeInsets.all(16),
                   itemCount: session.messages.length,
-                  itemBuilder: (ctx, i) =>
-                      MessageBubbleCard(message: session.messages[i]),
+                  itemBuilder: (ctx, i) => MessageBubbleCard(
+                    message: session.messages[i],
+                    sessionTitle: session.title,
+                  ),
                 ),
         ),
 

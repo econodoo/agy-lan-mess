@@ -33,7 +33,7 @@ jobs:
           (cd apps/mesh_client && flutter test)
 
   build-windows:
-    name: Build Windows x64 (Client App + Hub Server)
+    name: Build Windows x64 (All-in-One Executable + Hub Server)
     needs: verify
     runs-on: windows-latest
     steps:
@@ -44,20 +44,20 @@ jobs:
           cache: true
       - name: Resolve Dependencies
         run: flutter pub get
-      - name: Compile Native Hub Server (.exe)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/windows/server | Out-Null
-          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/windows/server/agy-mesh-server.exe
-          Copy-Item -Recurse scripts dist/windows/server/scripts
-      - name: Build Flutter Windows Desktop Client
+      - name: Build Flutter Web Console
+        working-directory: apps/mesh_client
+        run: flutter build web --release
+      - name: Build Flutter Windows Desktop App (agy-lan-mesh.exe)
         working-directory: apps/mesh_client
         run: flutter build windows --release
-      - name: Package Windows Zip Archive
+      - name: Compile Native Hub Server & Package Single-Folder Zip
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist/windows/client | Out-Null
-          Copy-Item -Recurse apps/mesh_client/build/windows/x64/runner/Release/* dist/windows/client/
+          New-Item -ItemType Directory -Force -Path dist/windows/apps/mesh_client/build | Out-Null
+          Copy-Item -Recurse apps/mesh_client/build/windows/x64/runner/Release/* dist/windows/
+          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/windows/agy-mesh-server.exe
+          Copy-Item -Recurse scripts dist/windows/scripts
+          Copy-Item -Recurse apps/mesh_client/build/web dist/windows/apps/mesh_client/build/web
           Copy-Item README.md dist/windows/
           Compress-Archive -Path dist/windows/* -DestinationPath agy-lan-mesh-windows-x64.zip -Force
       - uses: actions/upload-artifact@v4
@@ -66,7 +66,7 @@ jobs:
           path: agy-lan-mesh-windows-x64.zip
 
   build-linux:
-    name: Build Linux x64 & Web (Client App + Hub Server + Web Console)
+    name: Build Linux x64 & Web (All-in-One Executable + Hub Server + Web Console)
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -84,16 +84,16 @@ jobs:
       - name: Build Flutter Web Console
         working-directory: apps/mesh_client
         run: flutter build web --release
-      - name: Build Flutter Linux Desktop Client
+      - name: Build Flutter Linux Desktop App (agy-lan-mesh)
         working-directory: apps/mesh_client
         run: flutter build linux --release
       - name: Compile Native Hub Server & Package Tarball
         run: |
-          mkdir -p dist/linux/server dist/linux/client dist/linux/apps/mesh_client/build
-          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/linux/server/agy-mesh-server
+          mkdir -p dist/linux/apps/mesh_client/build
+          cp -r apps/mesh_client/build/linux/x64/release/bundle/* dist/linux/
+          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/linux/agy-mesh-server
           cp -r scripts dist/linux/
           cp -r apps/mesh_client/build/web dist/linux/apps/mesh_client/build/web
-          cp -r apps/mesh_client/build/linux/x64/release/bundle/* dist/linux/client/
           cp README.md dist/linux/
           tar -czf agy-lan-mesh-linux-x64.tar.gz -C dist/linux .
       - uses: actions/upload-artifact@v4
@@ -102,7 +102,7 @@ jobs:
           path: agy-lan-mesh-linux-x64.tar.gz
 
   build-macos:
-    name: Build macOS (Client App + Hub Server)
+    name: Build macOS (All-in-One App + Hub Server)
     needs: verify
     runs-on: macos-latest
     steps:
@@ -135,12 +135,14 @@ jobs:
           EOF
           cp macos/Runner/Release.entitlements macos/Runner/DebugProfile.entitlements
           cd ../.. && flutter pub get
-      - name: Build Flutter macOS Client & Native Hub Server
+      - name: Build Flutter macOS App, Web Console & Native Hub Server
         run: |
-          mkdir -p dist/macos/server
-          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/macos/server/agy-mesh-server
-          cp -r scripts dist/macos/
+          mkdir -p dist/macos/apps/mesh_client/build
+          (cd apps/mesh_client && flutter build web --release)
           (cd apps/mesh_client && flutter build macos --release)
+          dart compile exe packages/mesh_server/bin/agy_mesh_server.dart -o dist/macos/agy-mesh-server
+          cp -r scripts dist/macos/
+          cp -r apps/mesh_client/build/web dist/macos/apps/mesh_client/build/web
           cp -R apps/mesh_client/build/macos/Build/Products/Release/*.app dist/macos/
           cp README.md dist/macos/
           cd dist/macos && zip -r ../../agy-lan-mesh-macos.zip .

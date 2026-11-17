@@ -124,6 +124,7 @@ class MeshHubServer {
     router.get('/api/sessions', _handleApiSessionsList);
     router.post('/api/sessions', _handleApiSessionCreate);
     router.post('/api/sessions/<id>/cancel', _handleApiSessionCancel);
+    router.post('/api/sessions/<id>/summarize', _handleApiSessionSummarize);
     router.delete('/api/sessions/<id>', _handleApiSessionDelete);
 
     // 5. Downloads directory (APK / portable zips)
@@ -244,9 +245,9 @@ class MeshHubServer {
         issuedToken = existingToken;
       } else if (pin.isNotEmpty && store.verifyPin(pin)) {
         issuedToken = null; // Will generate below
-      } else if (isLoopback && !registerAsNode) {
-        // Frictionless Server Console auto-auth strictly on 127.0.0.1 / ::1
-        issuedToken = store.loopbackAdminToken;
+      } else if (isLoopback && pin.isEmpty) {
+        // Frictionless auto-auth strictly on 127.0.0.1 / ::1 for local Desktop App & Web Console
+        issuedToken = registerAsNode ? null : store.loopbackAdminToken;
       } else {
         peer.send(WsEnvelope(
           type: WsTypes.authError,
@@ -425,6 +426,13 @@ class MeshHubServer {
             id: env.id,
             payload: {'session': session.toJson()},
           ));
+        }
+        break;
+
+      case WsTypes.sessionSummarize:
+        final sessionId = pMap['sessionId'] as String? ?? '';
+        if (sessionId.isNotEmpty) {
+          unawaited(brain.summarizeSession(sessionId));
         }
         break;
 
@@ -644,6 +652,22 @@ class MeshHubServer {
     if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
     final cancelled = await brain.cancelSessionTurn(id);
     return _apiJson({'ok': true, 'cancelled': cancelled});
+  }
+
+  Future<Response> _handleApiSessionSummarize(Request req, String id) async {
+    if (!_isAuthorizedHttp(req)) return Response.forbidden('Unauthorized');
+    final summary = await brain.summarizeSession(id);
+    if (summary == null) {
+      return Response.notFound(
+        jsonEncode({'error': 'Session not found, empty, or currently running'}),
+      );
+    }
+    final session = store.getSession(id);
+    return _apiJson({
+      'ok': true,
+      'summary': summary.toJson(),
+      'markdown': summary.toMarkdown(sessionTitle: session?.title),
+    });
   }
 
   Future<Response> _handleApiSessionDelete(Request req, String id) async {

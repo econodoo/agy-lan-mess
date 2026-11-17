@@ -250,6 +250,24 @@ class PairingAndSessionStore {
     return updated;
   }
 
+  /// Places or refreshes the session's completion summary card at the end of the message list.
+  MeshSession? upsertSessionSummaryMessage(
+    String sessionId,
+    SessionMessage summaryMessage,
+  ) {
+    final current = _sessions[sessionId];
+    if (current == null) return null;
+    final withoutOldSummaries =
+        current.messages.where((m) => m.role != 'summary').toList();
+    final updated = current.copyWith(
+      messages: [...withoutOldSummaries, summaryMessage],
+      updatedAt: DateTime.now().toUtc().toIso8601String(),
+    );
+    _sessions[sessionId] = updated;
+    scheduleSave();
+    return updated;
+  }
+
   bool deleteSession(String sessionId) {
     final removed = _sessions.remove(sessionId) != null;
     if (removed) scheduleSave();

@@ -568,7 +568,7 @@ class TargetNodeAgent:
         def _loop():
             print(
                 f"💬 Interactive Brain Chat Ready! Type any prompt to run on '{socket.gethostname()}' "
-                f"(cwd: {self.cwd}), or '/new' for a fresh session.\n> ",
+                f"(cwd: {self.cwd}), '/summary' for a Brag Card, or '/new' for a fresh session.\n> ",
                 end="",
                 flush=True,
             )
@@ -584,6 +584,16 @@ class TargetNodeAgent:
                     if text == "/new":
                         self.active_session_id = str(uuid.uuid4())
                         print(f"[Started fresh session {self.active_session_id}]\n> ", end="", flush=True)
+                        continue
+                    if text == "/summary":
+                        if not self.active_session_id:
+                            print("[No active session yet]\n> ", end="", flush=True)
+                            continue
+                        if self.ws and not self.ws.closed:
+                            self.ws.send_text(json.dumps({
+                                "type": "session.summarize",
+                                "payload": {"sessionId": self.active_session_id},
+                            }))
                         continue
                     if not self.active_session_id:
                         self.active_session_id = str(uuid.uuid4())
@@ -665,6 +675,28 @@ class TargetNodeAgent:
                                 te = payload.get("toolEvent") or {}
                                 if te.get("status") == "running":
                                     print(f"\n🔧 {te.get('summary')}", flush=True)
+                            elif kind == "session_summary":
+                                sm = payload.get("summary") or {}
+                                dur_ms = int(sm.get("activeDurationMs") or 0)
+                                dur_str = f"{dur_ms / 1000.0:.1f}s" if dur_ms < 60000 else f"{dur_ms // 60000}m {(dur_ms % 60000) // 1000}s"
+                                in_tok = int(sm.get("inputTokens") or 0)
+                                out_tok = int(sm.get("outputTokens") or 0)
+                                th_tok = int(sm.get("thinkingTokens") or 0)
+                                tot_tok = in_tok + out_tok + th_tok
+                                turns = int(sm.get("turnsCount") or 1)
+                                tools = int(sm.get("toolCallsCount") or 0)
+                                print(
+                                    f"\n\n╔══════════════════════════════════════════════════════════════════════╗\n"
+                                    f"║ 🏆 SESSION COMPLETED  •  {str(sm.get('targetNodeName') or socket.gethostname())}  •  {str(sm.get('modelLabel') or 'Brain')}\n"
+                                    f"╠══════════════════════════════════════════════════════════════════════╣\n"
+                                    f"║ 🎯 Issue       : {sm.get('issue', '')}\n"
+                                    f"║ 🔍 Findings    : {sm.get('findings', '')}\n"
+                                    f"║ 🛠️  What We Did : {sm.get('actionsTaken', '')}\n"
+                                    f"╠══════════════════════════════════════════════════════════════════════╣\n"
+                                    f"║ ⏱️  Time: {dur_str} ({turns} turn{'s' if turns != 1 else ''})  •  🔧 Actions: {tools}  •  🪙 Tokens: {tot_tok:,} ({in_tok:,} in / {out_tok:,} out)\n"
+                                    f"╚══════════════════════════════════════════════════════════════════════╝",
+                                    flush=True,
+                                )
                     elif mtype == "session.detail":
                         sess = payload.get("session") or {}
                         if sess.get("sessionId") == self.active_session_id and sess.get("status") in ("idle", "error"):

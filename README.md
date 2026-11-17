@@ -11,6 +11,7 @@ Run **Antigravity (`agy`)** on a single primary computer on your LAN, and seamle
    - Runs natively on **Linux**, **Windows**, **Android**, and **Web** (served directly by the Hub at `http://<server-ip>:8765`).
    - Supports **Multi-Session Sidebar** (filter by machine, browse remote directories, run parallel sessions across different computers, cancel turns).
    - **Privilege Controls**: Windows Admin detection + one-click `RunAs` relaunch; Linux `su -` (`root`) or **RAM-only Local Sudo Vault** (password never leaves client RAM); per-device toggle between **`Ask Approval for Admin/Sudo`** and **`Full Auto`**.
+   - **Screenshot-Ready Session Summary ("Brag Card")**: Automatically appends a structured **Session Completed** summary card at the end of completed tasks (or on demand via the **Summary Card** button / `sessions summarize <id>`), highlighting **Issue**, **Findings**, **What We Did**, **Time Spent**, **Remote Actions**, and **Tokens Used**.
 3. **Zero-Install 1-Command Target Agents (`scripts/agent.ps1` & `scripts/agent.py`)**:
    - Connect any Windows PC (PowerShell) or Linux machine (Python 3 stdlib only—zero pip packages) in 5 seconds over HTTP.
 
@@ -18,12 +19,10 @@ Run **Antigravity (`agy`)** on a single primary computer on your LAN, and seamle
 
 ## Quickstart
 
-### 1. Start the Hub Server (on the machine where `agy` is logged in)
-```bash
-cd /home/tmc/Projects/agy-lan-mesh
-./build/agy-mesh-server start --register-mcp
-```
-Note the **6-Digit Pairing PIN** and LAN URL printed in the banner, or open `http://127.0.0.1:8765` on the server to manage all project sessions visually.
+### 1. Launch the Single Executable (on the machine where `agy` is logged in)
+Simply launch **`agy-lan-mesh`** (Linux), **`agy-lan-mesh.exe`** (Windows), or **`mesh_client.app`** (macOS):
+- On your primary `agy` machine, the Desktop App **automatically boots the bundled Hub Server in the background**, registers the `lan-mesh` MCP server, exposes the local machine, and opens the GUI console with zero terminal commands or PIN entry!
+- For headless servers (SSH / no GUI), just run `./agy-mesh-server` directly with no flags.
 
 ### 2. Connect Target Computers (No `agy` install or login required!)
 

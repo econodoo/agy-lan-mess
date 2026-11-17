@@ -208,14 +208,141 @@ class ToolCallSummary {
       );
 }
 
+class SessionCompletionSummary {
+  final String issue;
+  final String findings;
+  final String actionsTaken;
+  final int activeDurationMs;
+  final int sessionSpanMs;
+  final int turnsCount;
+  final int toolCallsCount;
+  final int inputTokens;
+  final int outputTokens;
+  final int thinkingTokens;
+  final String modelLabel;
+  final String targetNodeName;
+  final String workspacePath;
+  final String generatedAt;
+
+  const SessionCompletionSummary({
+    required this.issue,
+    required this.findings,
+    required this.actionsTaken,
+    this.activeDurationMs = 0,
+    this.sessionSpanMs = 0,
+    this.turnsCount = 1,
+    this.toolCallsCount = 0,
+    this.inputTokens = 0,
+    this.outputTokens = 0,
+    this.thinkingTokens = 0,
+    this.modelLabel = '',
+    this.targetNodeName = '',
+    this.workspacePath = '',
+    required this.generatedAt,
+  });
+
+  int get totalTokens => inputTokens + outputTokens + thinkingTokens;
+
+  static String formatDuration(int ms) {
+    if (ms < 1000) return '${ms}ms';
+    final totalSec = ms / 1000.0;
+    if (totalSec < 60) return '${totalSec.toStringAsFixed(1)}s';
+    final mins = ms ~/ 60000;
+    final remSec = ((ms % 60000) / 1000).round();
+    if (mins < 60) return '${mins}m ${remSec}s';
+    final hours = mins ~/ 60;
+    final remMins = mins % 60;
+    return '${hours}h ${remMins}m';
+  }
+
+  static String formatTokens(int count) {
+    if (count >= 1000000) {
+      return '${(count / 1000000.0).toStringAsFixed(2)}M';
+    }
+    if (count >= 1000) {
+      return '${(count / 1000.0).toStringAsFixed(1)}k';
+    }
+    return count.toString();
+  }
+
+  String toMarkdown({String? sessionTitle}) {
+    final buf = StringBuffer()
+      ..writeln(
+        '### 🏆 Session Completed${sessionTitle != null && sessionTitle.isNotEmpty ? " — $sessionTitle" : ""}',
+      );
+    if (targetNodeName.isNotEmpty || modelLabel.isNotEmpty) {
+      final meta = <String>[
+        if (targetNodeName.isNotEmpty) '🖥️ **$targetNodeName**',
+        if (workspacePath.isNotEmpty) '`($workspacePath)`',
+        if (modelLabel.isNotEmpty) '🧠 **$modelLabel**',
+      ].join('  •  ');
+      buf.writeln(meta);
+    }
+    buf
+      ..writeln()
+      ..writeln('- **🎯 Issue:** $issue')
+      ..writeln('- **🔍 Findings:** $findings')
+      ..writeln('- **🛠️ What We Did:** $actionsTaken')
+      ..writeln()
+      ..writeln(
+        '> ⏱️ **Time Spent:** ${formatDuration(activeDurationMs)} active (${turnsCount == 1 ? "1 turn" : "$turnsCount turns"})  •  '
+        '🔧 **Remote Actions:** $toolCallsCount  •  '
+        '🪙 **Tokens:** ${formatTokens(totalTokens)} (${formatTokens(inputTokens)} in / ${formatTokens(outputTokens)} out${thinkingTokens > 0 ? " / ${formatTokens(thinkingTokens)} think" : ""})',
+      );
+    return buf.toString().trim();
+  }
+
+  Map<String, dynamic> toJson() => {
+        'issue': issue,
+        'findings': findings,
+        'actionsTaken': actionsTaken,
+        'activeDurationMs': activeDurationMs,
+        'sessionSpanMs': sessionSpanMs,
+        'turnsCount': turnsCount,
+        'toolCallsCount': toolCallsCount,
+        'inputTokens': inputTokens,
+        'outputTokens': outputTokens,
+        'thinkingTokens': thinkingTokens,
+        'modelLabel': modelLabel,
+        'targetNodeName': targetNodeName,
+        'workspacePath': workspacePath,
+        'generatedAt': generatedAt,
+      };
+
+  factory SessionCompletionSummary.fromJson(Map<String, dynamic> json) =>
+      SessionCompletionSummary(
+        issue: json['issue'] as String? ?? '',
+        findings: json['findings'] as String? ?? '',
+        actionsTaken: json['actionsTaken'] as String? ?? '',
+        activeDurationMs: (json['activeDurationMs'] as num?)?.toInt() ?? 0,
+        sessionSpanMs: (json['sessionSpanMs'] as num?)?.toInt() ?? 0,
+        turnsCount: (json['turnsCount'] as num?)?.toInt() ?? 1,
+        toolCallsCount: (json['toolCallsCount'] as num?)?.toInt() ?? 0,
+        inputTokens: (json['inputTokens'] as num?)?.toInt() ?? 0,
+        outputTokens: (json['outputTokens'] as num?)?.toInt() ?? 0,
+        thinkingTokens: (json['thinkingTokens'] as num?)?.toInt() ?? 0,
+        modelLabel: json['modelLabel'] as String? ?? '',
+        targetNodeName: json['targetNodeName'] as String? ?? '',
+        workspacePath: json['workspacePath'] as String? ?? '',
+        generatedAt: json['generatedAt'] as String? ??
+            DateTime.now().toUtc().toIso8601String(),
+      );
+}
+
 class SessionMessage {
   final String id;
-  final String role; // user | assistant | system
+  final String role; // user | assistant | system | summary
   final String text;
   final String thinking;
   final List<ToolCallSummary> toolEvents;
   final String timestamp;
   final String status; // streaming | done | error
+  final int? durationMs;
+  final int? inputTokens;
+  final int? outputTokens;
+  final int? thinkingTokens;
+  final String? modelLabel;
+  final SessionCompletionSummary? completionSummary;
 
   const SessionMessage({
     required this.id,
@@ -225,13 +352,28 @@ class SessionMessage {
     this.toolEvents = const [],
     required this.timestamp,
     this.status = 'done',
+    this.durationMs,
+    this.inputTokens,
+    this.outputTokens,
+    this.thinkingTokens,
+    this.modelLabel,
+    this.completionSummary,
   });
+
+  int get totalTokens =>
+      (inputTokens ?? 0) + (outputTokens ?? 0) + (thinkingTokens ?? 0);
 
   SessionMessage copyWith({
     String? text,
     String? thinking,
     List<ToolCallSummary>? toolEvents,
     String? status,
+    int? durationMs,
+    int? inputTokens,
+    int? outputTokens,
+    int? thinkingTokens,
+    String? modelLabel,
+    SessionCompletionSummary? completionSummary,
   }) =>
       SessionMessage(
         id: id,
@@ -241,6 +383,12 @@ class SessionMessage {
         toolEvents: toolEvents ?? this.toolEvents,
         timestamp: timestamp,
         status: status ?? this.status,
+        durationMs: durationMs ?? this.durationMs,
+        inputTokens: inputTokens ?? this.inputTokens,
+        outputTokens: outputTokens ?? this.outputTokens,
+        thinkingTokens: thinkingTokens ?? this.thinkingTokens,
+        modelLabel: modelLabel ?? this.modelLabel,
+        completionSummary: completionSummary ?? this.completionSummary,
       );
 
   Map<String, dynamic> toJson() => {
@@ -251,6 +399,14 @@ class SessionMessage {
         'toolEvents': toolEvents.map((e) => e.toJson()).toList(),
         'timestamp': timestamp,
         'status': status,
+        if (durationMs != null) 'durationMs': durationMs,
+        if (inputTokens != null) 'inputTokens': inputTokens,
+        if (outputTokens != null) 'outputTokens': outputTokens,
+        if (thinkingTokens != null) 'thinkingTokens': thinkingTokens,
+        if (modelLabel != null && modelLabel!.isNotEmpty)
+          'modelLabel': modelLabel,
+        if (completionSummary != null)
+          'completionSummary': completionSummary!.toJson(),
       };
 
   factory SessionMessage.fromJson(Map<String, dynamic> json) => SessionMessage(
@@ -266,6 +422,16 @@ class SessionMessage {
         timestamp:
             json['timestamp'] as String? ?? DateTime.now().toUtc().toIso8601String(),
         status: json['status'] as String? ?? 'done',
+        durationMs: (json['durationMs'] as num?)?.toInt(),
+        inputTokens: (json['inputTokens'] as num?)?.toInt(),
+        outputTokens: (json['outputTokens'] as num?)?.toInt(),
+        thinkingTokens: (json['thinkingTokens'] as num?)?.toInt(),
+        modelLabel: json['modelLabel'] as String?,
+        completionSummary: json['completionSummary'] is Map
+            ? SessionCompletionSummary.fromJson(
+                Map<String, dynamic>.from(json['completionSummary'] as Map),
+              )
+            : null,
       );
 }
 
@@ -293,6 +459,40 @@ class MeshSession {
     required this.updatedAt,
     this.messages = const [],
   });
+
+  int get totalTurns =>
+      messages.where((m) => m.role == 'assistant' && m.status == 'done').length;
+
+  int get totalToolCalls =>
+      messages.fold(0, (sum, m) => sum + m.toolEvents.length);
+
+  int get totalActiveDurationMs => messages
+      .where((m) => m.role == 'assistant')
+      .fold(0, (sum, m) => sum + (m.durationMs ?? 0));
+
+  int get totalInputTokens => messages
+      .where((m) => m.role == 'assistant')
+      .fold(0, (sum, m) => sum + (m.inputTokens ?? 0));
+
+  int get totalOutputTokens => messages
+      .where((m) => m.role == 'assistant')
+      .fold(0, (sum, m) => sum + (m.outputTokens ?? 0));
+
+  int get totalThinkingTokens => messages
+      .where((m) => m.role == 'assistant')
+      .fold(0, (sum, m) => sum + (m.thinkingTokens ?? 0));
+
+  int get totalTokens =>
+      totalInputTokens + totalOutputTokens + totalThinkingTokens;
+
+  SessionCompletionSummary? get latestSummary {
+    for (var i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].completionSummary != null) {
+        return messages[i].completionSummary;
+      }
+    }
+    return null;
+  }
 
   MeshSession copyWith({
     String? title,
@@ -329,6 +529,11 @@ class MeshSession {
         'createdAt': createdAt,
         'updatedAt': updatedAt,
         'messageCount': messages.length,
+        'totalTurns': totalTurns,
+        'totalToolCalls': totalToolCalls,
+        'totalActiveDurationMs': totalActiveDurationMs,
+        'totalTokens': totalTokens,
+        'hasSummary': latestSummary != null,
         'lastMessagePreview': messages.isNotEmpty
             ? (messages.last.text.length > 100
                 ? '${messages.last.text.substring(0, 100)}...'

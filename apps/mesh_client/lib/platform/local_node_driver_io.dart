@@ -15,6 +15,7 @@ class LocalNodeDriver {
   /// Kept strictly in local process memory—never persisted or sent over the network.
   String? _sudoPassword;
   final Map<String, Process> _runningProcesses = {};
+  Process? _spawnedHubProcess;
 
   bool get isWebConsole => false;
   bool get isDesktopTarget =>
@@ -23,6 +24,8 @@ class LocalNodeDriver {
   bool get isLinux => Platform.isLinux;
   bool get isAndroid => Platform.isAndroid;
   bool get isSudoUnlocked => _sudoPassword != null && _sudoPassword!.isNotEmpty;
+  bool get hasBundledServerBinary => findBundledServerBinary() != null;
+  bool get isManagingLocalHub => _spawnedHubProcess != null;
 
   String get defaultHostname => Platform.localHostname;
   String get osName => Platform.operatingSystem;
@@ -139,13 +142,145 @@ class LocalNodeDriver {
       socket.send(probeBytes, InternetAddress('255.255.255.255'), discoveryPort);
 
       return await completer.future.timeout(
-        const Duration(milliseconds: 2200),
+        const Duration(milliseconds: 1400),
         onTimeout: () => null,
       );
     } catch (_) {
       return null;
     } finally {
       socket?.close();
+    }
+  }
+
+  String? findBundledServerBinary() {
+    if (!isDesktopTarget) return null;
+    final binName = Platform.isWindows ? 'agy-mesh-server.exe' : 'agy-mesh-server';
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    final candidates = <String>[
+      p.join(exeDir, binName),
+      p.normalize(p.join(exeDir, '..', binName)),
+      p.normalize(p.join(exeDir, '..', 'server', binName)),
+      p.normalize(p.join(exeDir, '..', '..', 'server', binName)),
+      p.normalize(p.join(exeDir, '..', '..', '..', binName)),
+      p.normalize(p.join(exeDir, '..', '..', '..', 'server', binName)),
+      p.normalize(
+        p.join(exeDir, '..', '..', '..', '..', '..', '..', 'build', binName),
+      ),
+      p.normalize(p.join(Directory.current.path, 'build', binName)),
+      p.normalize(p.join(Directory.current.path, binName)),
+    ];
+    for (final c in candidates) {
+      if (File(c).existsSync()) return c;
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> probeLocalHubStatus({int port = 8765}) async {
+    if (Platform.isAndroid) return null;
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(milliseconds: 450);
+    try {
+      final req = await client
+          .getUrl(Uri.parse('http://127.0.0.1:$port/api/status'))
+          .timeout(const Duration(milliseconds: 500));
+      final resp =
+          await req.close().timeout(const Duration(milliseconds: 600));
+      if (resp.statusCode != 200) return null;
+      final body = await resp.transform(utf8.decoder).join();
+      final decoded = jsonDecode(body);
+      if (decoded is Map && decoded['service'] == 'agy-lan-mesh') {
+        return Map<String, dynamic>.from(decoded);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<bool> _isLocalAgyCliPresent() async {
+    try {
+      final res = await Process.run(
+        'agy',
+        ['--version'],
+        runInShell: Platform.isWindows,
+      ).timeout(const Duration(seconds: 2));
+      return res.exitCode == 0;
+    } catch (_) {
+      final home = Platform.environment['HOME'] ?? '';
+      if (home.isNotEmpty &&
+          File(p.join(home, '.gemini', 'antigravity-cli', 'bin', 'agy'))
+              .existsSync()) {
+        return true;
+      }
+      return false;
+    }
+  }
+
+  /// Automatically boots the bundled `agy-mesh-server` in the background when
+  /// running the single Desktop App executable on the Brain computer.
+  Future<bool> ensureLocalHubRunning({
+    int port = 8765,
+    bool force = false,
+  }) async {
+    if (!isDesktopTarget) return false;
+    if (await probeLocalHubStatus(port: port) != null) return true;
+
+    final serverBin = findBundledServerBinary();
+    if (serverBin == null) return false;
+
+    if (!force && !await _isLocalAgyCliPresent()) {
+      return false;
+    }
+
+    try {
+      final home = Platform.environment['HOME'] ?? '';
+      final fallbackAgy = home.isNotEmpty
+          ? p.join(home, '.gemini', 'antigravity-cli', 'bin', 'agy')
+          : '';
+      final extraArgs = <String>[
+        'start',
+        '--port',
+        '$port',
+        '--expose-local-node',
+        if (fallbackAgy.isNotEmpty && File(fallbackAgy).existsSync()) ...[
+          '--agy-bin',
+          fallbackAgy,
+        ],
+      ];
+      final proc = await Process.start(
+        serverBin,
+        extraArgs,
+        workingDirectory: File(serverBin).parent.path,
+      );
+      _spawnedHubProcess = proc;
+      // Drain pipes so child process never blocks on stdout/stderr buffers
+      proc.stdout.drain<void>().ignore();
+      proc.stderr.drain<void>().ignore();
+      unawaited(proc.exitCode.then((_) {
+        if (identical(_spawnedHubProcess, proc)) {
+          _spawnedHubProcess = null;
+        }
+      }));
+
+      for (var i = 0; i < 30; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+        if (await probeLocalHubStatus(port: port) != null) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  void stopSpawnedLocalHub() {
+    final proc = _spawnedHubProcess;
+    _spawnedHubProcess = null;
+    if (proc != null) {
+      try {
+        proc.kill(ProcessSignal.sigterm);
+      } catch (_) {}
     }
   }
 

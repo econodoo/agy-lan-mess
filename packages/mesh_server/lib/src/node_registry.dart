@@ -140,6 +140,10 @@ class NodeRegistry {
 
   static const String localServerNodeId = 'server-local';
 
+  bool hasActiveTasksForSession(String sessionId) => _tasks.values.any(
+        (t) => t.requestingSessionId == sessionId && t.info.isActive,
+      );
+
   NodeInfo _buildLocalServerNodeInfo() {
     final now = DateTime.now().toUtc().toIso8601String();
     final isRoot = !Platform.isWindows &&

@@ -13,6 +13,8 @@ class LocalNodeDriver {
   bool get isLinux => false;
   bool get isAndroid => false;
   bool get isSudoUnlocked => false;
+  bool get hasBundledServerBinary => false;
+  bool get isManagingLocalHub => false;
 
   String get defaultHostname => 'Web Console';
   String get osName => 'web';
@@ -37,6 +39,17 @@ class LocalNodeDriver {
 
   Future<DiscoveredHub?> discoverLanHub({int discoveryPort = 8766}) async =>
       null;
+
+  Future<Map<String, dynamic>?> probeLocalHubStatus({int port = 8765}) async =>
+      null;
+
+  Future<bool> ensureLocalHubRunning({
+    int port = 8765,
+    bool force = false,
+  }) async =>
+      false;
+
+  void stopSpawnedLocalHub() {}
 
   Future<bool> unlockSudo(String password) async => false;
 
